@@ -52,11 +52,13 @@ async def init_db(pool):
                 user_id BIGINT PRIMARY KEY
             );
         """)
+        # Теперь храним порядковый номер (ticket_number)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS participants (
                 giveaway_id INT,
                 user_id BIGINT,
                 username TEXT,
+                ticket_number INT,
                 PRIMARY KEY (giveaway_id, user_id)
             );
         """)
@@ -91,16 +93,28 @@ async def add_creator(pool, user_id):
         await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", user_id)
         return exists
 
-async def add_participant(pool, giveaway_id, user_id, username):
+async def add_participant_with_ticket(pool, giveaway_id, user_id, username):
     async with pool.acquire() as conn:
-        try:
-            await conn.execute(
-                "INSERT INTO participants (giveaway_id, user_id, username) VALUES ($1, $2, $3);",
-                giveaway_id, user_id, username or "Без username"
-            )
-            return True
-        except asyncpg.UniqueViolationError:
-            return False
+        # Проверяем, не участвует ли уже
+        existing = await conn.fetchrow(
+            "SELECT ticket_number FROM participants WHERE giveaway_id = $1 AND user_id = $2",
+            giveaway_id, user_id
+        )
+        if existing:
+            return existing["ticket_number"], False  # Уже в базе, возвращаем его номер
+
+        # Узнаем последний номер и прибавляем 1
+        max_ticket = await conn.fetchval(
+            "SELECT MAX(ticket_number) FROM participants WHERE giveaway_id = $1",
+            giveaway_id
+        )
+        next_ticket = (max_ticket or 0) + 1
+
+        await conn.execute(
+            "INSERT INTO participants (giveaway_id, user_id, username, ticket_number) VALUES ($1, $2, $3, $4);",
+            giveaway_id, user_id, username or "Без username", next_ticket
+        )
+        return next_ticket, True
 
 async def create_fast_click(pool, giveaway_id, creator_id, prize_details):
     async with pool.acquire() as conn:
@@ -204,20 +218,20 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
                 if member.status in ["left", "kicked"]:
                     await message.answer(
                         "❌ **Вы не подписаны на канал!**\n\n"
-                        f"Чтобы принять участие, подпишитесь на канал {channel_id} и нажмите кнопку «Участвовать» снова."
+                        f"Чтобы принять участие, подпишитесь на канал {channel_id} и перейдите по ссылке розыгрыша снова."
                     )
                     return
             except Exception:
-                pass # Пропускаем, если API прокси временно не ответил, чтобы пользователь не страдал
+                pass
 
-        success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
-        if success:
+        ticket_number, is_new = await add_participant_with_ticket(pool, giveaway_id, user_id, message.from_user.username)
+        if is_new:
             await message.answer(
-                "🎉 **Ты успешно участвуешь в розыгрыше!**\n"
-                "Твой номер участника зафиксирован ботом."
+                f"🎉 **Ты успешно участвуешь в розыгрыше!**\n"
+                f"🎟 Твой порядковый номер: **#{ticket_number}**"
             )
         else:
-            await message.answer("ℹ️ Вы уже зарегистрированы в этом розыгрыше!")
+            await message.answer(f"ℹ️ Ты уже зарегистрирован в этом розыгрыше! Твой номер: **#{ticket_number}**")
         return
 
     if await is_creator(pool, user_id):
@@ -340,7 +354,7 @@ async def cmd_finish(message: types.Message):
 
     giveaway_id = int(args[1])
     async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id, username FROM participants WHERE giveaway_id = $1", giveaway_id)
+        rows = await conn.fetch("SELECT user_id, username, ticket_number FROM participants WHERE giveaway_id = $1", giveaway_id)
 
     if not rows:
         await message.answer(f"❌ В розыгрыше `#{giveaway_id}` пока нет участников!")
@@ -351,7 +365,7 @@ async def cmd_finish(message: types.Message):
 
     await message.answer(
         f"🎉 **ИТОГИ РОЗЫГРЫША #{giveaway_id}** 🎉\n\n"
-        f"🏆 **Победитель:** {winner_username} (`ID: {winner['user_id']}`)\n"
+        f"🏆 **Победитель:** {winner_username} (Номер билета: **#{winner['ticket_number']}**)\n"
         f"👥 Всего участников: {len(rows)}\n\n"
         f"💬 *Скопируйте этот текст и опубликуйте его в своём канале!*",
         parse_mode="Markdown"
@@ -374,7 +388,7 @@ async def cmd_reroll(message: types.Message):
             old_winner_id = int(args[2])
             await conn.execute("DELETE FROM participants WHERE giveaway_id = $1 AND user_id = $2", giveaway_id, old_winner_id)
 
-        rows = await conn.fetch("SELECT user_id, username FROM participants WHERE giveaway_id = $1", giveaway_id)
+        rows = await conn.fetch("SELECT user_id, username, ticket_number FROM participants WHERE giveaway_id = $1", giveaway_id)
 
     if not rows:
         await message.answer(f"❌ В розыгрыше `#{giveaway_id}` больше нет других участников для реролла!")
@@ -385,7 +399,7 @@ async def cmd_reroll(message: types.Message):
 
     await message.answer(
         f"🔄 **ПЕРЕРОЛЛ РОЗЫГРЫША #{giveaway_id}** 🔄\n\n"
-        f"🏆 **Новый победитель:** {winner_username} (`ID: {new_winner['user_id']}`)\n"
+        f"🏆 **Новый победитель:** {winner_username} (Номер билета: **#{new_winner['ticket_number']}**)\n"
         f"👥 Осталось участников в пуле: {len(rows)}\n\n"
         f"💬 *Опубликуйте этот результат в канале!*",
         parse_mode="Markdown"
@@ -465,25 +479,22 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         text = (
             f"⚡️ **ФАСТ-КЛИК РОЗЫГРЫШ!** ⚡️\n\n"
             f"🎁 **Приз:** {prize_details}\n\n"
-            f"🚀 Кто первый нажмёт на кнопку ниже, тот и забирает приз!\n\n"
+            f"🚀 Кто первый нажмёт на ссылку ниже, тот и забирает приз!\n\n"
+            f"👉 [⚡️ Забрать приз!]({fast_link})\n\n"
             f"⏱ *Победитель определяется мгновенно.*"
         )
 
-        builder = InlineKeyboardBuilder()
-        builder.button(text="⚡️ Забрать приз!", url=fast_link)
-
-        await message.answer(f"⚡️ **Ваш Фаст-Клик конкурс готов! (ID: `{giveaway_id}`) Перешлите пост в канал:**", parse_mode="Markdown")
-        await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+        await message.answer(f"⚡️ **Ваш Фаст-Клик конкурс готов! (ID: `{giveaway_id}`) Скопируйте текст в свой канал:**", parse_mode="Markdown")
+        await message.answer(text, parse_mode="Markdown")
         await state.clear()
     else:
         await message.answer(
             "📢 **Введите юзернейм вашего канала**\n"
             "(например: `@PavelBet`)\n\n"
-            "ℹ️ *Бот должен быть администратором в этом канале для проверки подписок участников.*"
+            "ℹ️ *Бот должен быть администратором в этом канале для проверки подписок.*"
         )
         await state.set_state(GiveawayForm.channel_username)
 
-# Сразу без лишних проверок принимаем юзернейм канала
 @dp.message(GiveawayForm.channel_username)
 async def process_channel(message: types.Message, state: FSMContext):
     channel_input = message.text.strip()
@@ -540,19 +551,17 @@ async def finish_creating_giveaway(message: types.Message, state: FSMContext, co
         f"{prize_text}\n"
         f"📌 **Условия участия:** {conditions} (Проверяется автоматически!)\n\n"
         f"🏆 **Победителей:** 1\n"
-        f"⏰ **Окончание:** По решению организатора"
+        f"⏰ **Окончание:** По решению организатора\n\n"
+        f"👉 [🎉 Участвовать в розыгрыше]({join_link})"
     )
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🎉 Участвовать в розыгрыше", url=join_link)
 
     await message.answer(
         f"✅ **Ваш пост с конкурсом готов! (ID: `{giveaway_id}`)**\n"
         f"Завершить: `/finish {giveaway_id}` | Переролл: `/reroll {giveaway_id}`\n\n"
-        f"Перешлите пост ниже в свой канал:",
+        f"Скопируйте текст ниже и вставьте в свой канал (кнопка исчезать не будет):",
         parse_mode="Markdown"
     )
-    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    await message.answer(text, parse_mode="Markdown")
     await state.clear()
 
 async def main():
