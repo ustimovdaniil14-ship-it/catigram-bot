@@ -8,9 +8,9 @@ from aiogram.filters import Command, CommandObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= Настройки =================
-BOT_TOKEN = "ТВОЙ_ТОКЕН_ТУТ"  # Вставь токен своего бота Catigram
-ADMIN_ID = 123456789            # Вставь свой Telegram ID
-ADMIN_USERNAME = "@imsexy"      # Вставь свой юзернейм
+BOT_TOKEN = "1780243771:Gb_eq0_l0bqdqxSG5aU1zTnkyVSUjHnETPp"
+ADMIN_ID = 1780243771
+ADMIN_USERNAME = "@imsexy"
 
 CATIGRAM_API_URL = "http://bot.catup.lol"
 # =============================================
@@ -25,9 +25,7 @@ dp = Dispatcher()
 def init_db():
     conn = sqlite3.connect("bot_data.db")
     cursor = conn.cursor()
-    # Таблица разрешённых создателей (VIP)
     cursor.execute("CREATE TABLE IF NOT EXISTS creators (user_id INTEGER PRIMARY KEY)")
-    # Таблица участников розыгрышей
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS participants (
             giveaway_id INTEGER,
@@ -73,13 +71,17 @@ def add_participant(giveaway_id, user_id, username):
 
 # --- Хэндлеры ---
 
-# Команда /start (с поддержкой диплинков start=join_12)
+# Команда /myid для проверки своего ID
+@dp.message(Command("myid"))
+async def cmd_myid(message: types.Message):
+    await message.answer(f"🆔 Твой Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
+
+# Команда /start
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, command: CommandObject):
     user_id = message.from_user.id
     args = command.args
 
-    # Если человек перешёл по ссылке участия (например /start join_12)
     if args and args.startswith("join_"):
         giveaway_id = args.split("_")[1]
         success = add_participant(giveaway_id, user_id, message.from_user.username)
@@ -93,16 +95,14 @@ async def cmd_start(message: types.Message, command: CommandObject):
             await message.answer("⚠️ Вы уже зарегистрированы в этом розыгрыше!")
         return
 
-    # Если человек просто запустил бота
     if is_creator(user_id):
         await message.answer(
             "👋 **Привет, Создатель!**\n\n"
             "У тебя есть доступ к созданию розыгрышей.\n"
             "Чтобы создать пост с конкурсом, используй команду:\n"
-            "`/new_giveaway <название> | <ссылка_на_канал>`"
+            "`/new_giveaway <название>`"
         )
     else:
-        # Экран покупки доступа
         builder = InlineKeyboardBuilder()
         builder.button(text="⭐️ Купить доступ — 1000 ⭐️", callback_data="buy_access")
         builder.button(text=f"💬 Написать {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME.replace('@', '')}")
@@ -115,7 +115,7 @@ async def cmd_start(message: types.Message, command: CommandObject):
             reply_markup=builder.as_markup()
         )
 
-# Кнопка покупки доступа за Stars
+# Покупка доступа за Звёзды
 @dp.callback_query(F.data == "buy_access")
 async def buy_access_callback(callback: types.CallbackQuery):
     prices = [types.LabeledPrice(label="Доступ к созданию розыгрышей", amount=1000)]
@@ -139,7 +139,7 @@ async def payment_success(message: types.Message):
     add_creator(message.from_user.id)
     await message.answer("🎉 **Оплата прошла успешно!** Теперь тебе доступно создание розыгрышей.")
 
-# Выдача доступа вручную админом: /give_access <user_id>
+# Ручная выдача доступа админом
 @dp.message(Command("give_access"))
 async def cmd_give_access(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -154,8 +154,7 @@ async def cmd_give_access(message: types.Message):
         except Exception:
             pass
 
-# Создание розыгрыша (для тех, у кого есть доступ)
-# Пример: /new_giveaway Розыгрыш на персик
+# Создание розыгрыша
 @dp.message(Command("new_giveaway"))
 async def cmd_new_giveaway(message: types.Message):
     if not is_creator(message.from_user.id):
@@ -163,7 +162,7 @@ async def cmd_new_giveaway(message: types.Message):
         return
 
     title = message.text.replace("/new_giveaway", "").strip() or "Розыгрыш"
-    giveaway_id = random.randint(10, 99) # Уникальный ID конкурса
+    giveaway_id = random.randint(10, 99)
 
     bot_info = await bot.get_me()
     bot_username = bot_info.username
