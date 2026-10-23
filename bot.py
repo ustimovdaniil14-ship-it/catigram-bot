@@ -17,7 +17,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ================= Настройки (из переменных окружения Render) =================
@@ -55,6 +55,11 @@ class JoinForm(StatesGroup):
 
 class DonateForm(StatesGroup):
     amount = State()
+
+
+class AdminForm(StatesGroup):
+    give = State()
+    revoke = State()
 
 
 # ============================== База данных ==============================
@@ -161,6 +166,30 @@ def norm_code(s: str) -> str:
     return " ".join((s or "").split()).casefold()
 
 
+BTN_NEW = "➕ Создать конкурс"
+BTN_MY = "📋 Мои конкурсы"
+BTN_FINISH = "🏁 Итоги"
+BTN_REROLL = "🔄 Переролл"
+BTN_ID = "🆔 Мой ID"
+BTN_DONATE = "💖 Донат"
+BTN_BUY = f"⭐️ Купить доступ ({PRICE_STARS})"
+BTN_ADMIN = "💬 Написать админу"
+BTN_GIVE = "🔑 Выдать доступ"
+BTN_REVOKE = "🚫 Забрать доступ"
+BTN_LIST = "👥 Доступы"
+
+
+def menu_kb(user_id: int, creator: bool) -> ReplyKeyboardMarkup:
+    if creator:
+        rows = [[BTN_NEW, BTN_MY], [BTN_FINISH, BTN_REROLL], [BTN_ID, BTN_DONATE]]
+        if user_id == ADMIN_ID:
+            rows += [[BTN_GIVE, BTN_REVOKE], [BTN_LIST]]
+    else:
+        rows = [[BTN_BUY, BTN_DONATE], [BTN_ID, BTN_ADMIN]]
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=t) for t in r] for r in rows], resize_keyboard=True)
+
+
 async def handle_ping(request):
     return web.Response(text="Bot is alive!")
 
@@ -174,14 +203,7 @@ async def start_dummy_server():
 
 
 async def set_main_menu(bot: Bot):
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Главное меню"),
-        BotCommand(command="new_giveaway", description="Создать новый конкурс"),
-        BotCommand(command="my", description="Мои конкурсы"),
-        BotCommand(command="finish", description="Итоги: /finish ID"),
-        BotCommand(command="reroll", description="Переролл: /reroll ID"),
-        BotCommand(command="myid", description="Узнать свой Telegram ID"),
-    ])
+    await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
 
 
 # ============================== Старт / участие ==============================
@@ -253,20 +275,142 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
         await begin_join(message, state, gid)
         return
 
-    if await is_creator(pool, user.id):
-        kb = InlineKeyboardBuilder()
-        kb.button(text="💖 Поддержать автора", callback_data="donate_stars")
-        await message.answer("👋 Привет, Создатель!\nИспользуй /new_giveaway для создания конкурса.",
-                             reply_markup=kb.as_markup())
+    creator = await is_creator(pool, user.id)
+    if creator:
+        text = "👋 Привет, Создатель!\nВыбирай действие в меню внизу 👇"
     else:
-        kb = InlineKeyboardBuilder()
-        kb.button(text=f"⭐️ Купить доступ — {PRICE_STARS}", callback_data="buy_access")
-        kb.button(text="💖 Пожертвовать звёзды", callback_data="donate_stars")
-        kb.button(text=f"💬 Написать {ADMIN_USERNAME}", url=f"{LINK_BASE}/{ADMIN_USERNAME.lstrip('@')}")
-        kb.adjust(1)
-        await message.answer("🔒 Создавать конкурсы могут только пользователи с доступом.\n"
-                             "Участвовать в конкурсах можно бесплатно — по ссылке из поста.",
-                             reply_markup=kb.as_markup())
+        text = ("🔒 Создавать конкурсы могут только пользователи с доступом.\n"
+                "Участвовать в конкурсах можно бесплатно — по ссылке из поста.\n\nМеню внизу 👇")
+    await message.answer(text, reply_markup=menu_kb(user.id, creator))
+
+
+# ============================== Кнопки меню ==============================
+# Эти обработчики стоят выше остальных, поэтому нажатие кнопки сбрасывает любой диалог.
+@dp.message(F.text == BTN_NEW)
+async def btn_new(message: types.Message, state: FSMContext):
+    await state.clear()
+    await cmd_new_giveaway(message, state)
+
+
+@dp.message(F.text == BTN_MY)
+async def btn_my(message: types.Message, state: FSMContext):
+    await state.clear()
+    await cmd_my(message)
+
+
+@dp.message(F.text.in_({BTN_FINISH, BTN_REROLL}))
+async def btn_draw_list(message: types.Message, state: FSMContext):
+    await state.clear()
+    pool = dp["pool"]
+    if not await is_creator(pool, message.from_user.id):
+        return
+    reroll = message.text == BTN_REROLL
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT g.id, g.prize, (SELECT count(*) FROM giveaway_participants p WHERE p.giveaway_id=g.id) AS cnt "
+            "FROM giveaways g WHERE g.creator_id=$1 AND g.kind='normal' AND g.status=$2 "
+            "ORDER BY g.id DESC LIMIT 10",
+            message.from_user.id, "finished" if reroll else "active")
+    if not rows:
+        await message.answer("Нет завершённых конкурсов для реролла." if reroll else "Нет активных конкурсов.")
+        return
+    kb = InlineKeyboardBuilder()
+    mode = "reroll" if reroll else "finish"
+    for r in rows:
+        kb.button(text=f"#{r['id']} · {r['prize'][:22]} · {r['cnt']} уч.", callback_data=f"draw_{mode}_{r['id']}")
+    kb.adjust(1)
+    await message.answer("Выберите конкурс для реролла:" if reroll else "Выберите конкурс для подведения итогов:",
+                         reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.regexp(r"^draw_(finish|reroll)_(\d+)$"))
+async def draw_callback(callback: types.CallbackQuery):
+    _, mode, gid = callback.data.split("_")
+    await callback.answer()
+    if not await is_creator(dp["pool"], callback.from_user.id):
+        return
+    await run_draw(callback.message, callback.from_user.id, int(gid), reroll=(mode == "reroll"))
+
+
+@dp.message(F.text == BTN_ID)
+async def btn_id(message: types.Message, state: FSMContext):
+    await state.clear()
+    await cmd_myid(message)
+
+
+@dp.message(F.text == BTN_DONATE)
+async def btn_donate(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Введите количество звёзд для пожертвования (только цифры):")
+    await state.set_state(DonateForm.amount)
+
+
+@dp.message(F.text == BTN_BUY)
+async def btn_buy(message: types.Message, state: FSMContext):
+    await state.clear()
+    if await is_creator(dp["pool"], message.from_user.id):
+        await message.answer("✅ У вас уже есть доступ.")
+        return
+    await bot.send_invoice(
+        chat_id=message.from_user.id, title="Доступ к боту", description="Покупка доступа (один раз, навсегда)",
+        payload=f"access_{message.from_user.id}", currency="XTR",
+        prices=[types.LabeledPrice(label="Доступ", amount=PRICE_STARS)], provider_token="")
+
+
+@dp.message(F.text == BTN_ADMIN)
+async def btn_admin(message: types.Message, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"💬 {ADMIN_USERNAME}", url=f"{LINK_BASE}/{ADMIN_USERNAME.lstrip('@')}")
+    await message.answer("Напишите админу:", reply_markup=kb.as_markup())
+
+
+# --- кнопки админа ---
+@dp.message(F.text == BTN_GIVE)
+async def btn_give(message: types.Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("Отправьте ID пользователя цифрами (он узнаёт его кнопкой «🆔 Мой ID»).\n"
+                         "Чтобы отменить — нажмите любую кнопку меню.")
+    await state.set_state(AdminForm.give)
+
+
+@dp.message(F.text == BTN_REVOKE)
+async def btn_revoke(message: types.Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("Отправьте ID пользователя, у которого забрать доступ.\n"
+                         "Чтобы отменить — нажмите любую кнопку меню.")
+    await state.set_state(AdminForm.revoke)
+
+
+@dp.message(F.text == BTN_LIST)
+async def btn_list(message: types.Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id == ADMIN_ID:
+        await list_creators(message)
+
+
+@dp.message(AdminForm.give)
+async def admin_give(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if message.from_user.id != ADMIN_ID or not txt.isdigit():
+        await message.answer("⚠️ Отправьте ID цифрами:")
+        return
+    await state.clear()
+    await grant_access(message, int(txt))
+
+
+@dp.message(AdminForm.revoke)
+async def admin_revoke(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if message.from_user.id != ADMIN_ID or not txt.isdigit():
+        await message.answer("⚠️ Отправьте ID цифрами:")
+        return
+    await state.clear()
+    await revoke_access(message, int(txt))
 
 
 # ============================== Оплата / донаты ==============================
@@ -319,59 +463,64 @@ async def payment_success(message: types.Message):
         await message.answer("💖 Спасибо за поддержку!")
     else:
         await add_creator(pool, message.from_user.id)
-        await message.answer("🎉 Оплата успешна! Доступ открыт. Используйте /new_giveaway")
+        await message.answer("🎉 Оплата успешна! Доступ открыт навсегда. Меню внизу 👇",
+                             reply_markup=menu_kb(message.from_user.id, True))
 
 
 # ============================== Админ: выдача доступа ==============================
-@dp.message(Command("give_access"))
-async def cmd_give_access(message: types.Message, command: CommandObject):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if not command.args or not command.args.strip().isdigit():
-        await message.answer("Использование: <code>/give_access ID</code>\n"
-                             "ID человек узнаёт командой /myid в этом боте.")
-        return
-    target = int(command.args.strip())
+async def grant_access(message: types.Message, target: int):
     if await add_creator(dp["pool"], target):
         await message.answer(f"ℹ️ У пользователя <code>{target}</code> уже есть доступ.")
         return
     await message.answer(f"✅ Доступ навсегда выдан пользователю <code>{target}</code>!")
     try:
-        await bot.send_message(target, f"🎉 Администратор {esc(ADMIN_USERNAME)} выдал вам бесплатный доступ! "
-                                       f"Используйте /new_giveaway")
+        await bot.send_message(target, f"🎉 Администратор {esc(ADMIN_USERNAME)} выдал вам бесплатный доступ навсегда!\n"
+                                       f"Меню внизу 👇", reply_markup=menu_kb(target, True))
     except TelegramAPIError:
         await message.answer("(Человеку не удалось отправить уведомление — пусть сам напишет боту /start.)")
 
 
-@dp.message(Command("revoke_access"))
-async def cmd_revoke_access(message: types.Message, command: CommandObject):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if not command.args or not command.args.strip().isdigit() or int(command.args) == ADMIN_ID:
-        await message.answer("Использование: <code>/revoke_access ID</code>")
+async def revoke_access(message: types.Message, target: int):
+    if target == ADMIN_ID:
+        await message.answer("❌ Нельзя забрать доступ у админа.")
         return
     async with dp["pool"].acquire() as conn:
-        await conn.execute("DELETE FROM creators WHERE user_id=$1", int(command.args))
-    await message.answer("✅ Доступ отозван.")
+        await conn.execute("DELETE FROM creators WHERE user_id=$1", target)
+    await message.answer(f"✅ Доступ у <code>{target}</code> отозван.")
 
 
-@dp.message(Command("creators"))
-async def cmd_creators(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
+async def list_creators(message: types.Message):
     async with dp["pool"].acquire() as conn:
         rows = await conn.fetch("SELECT user_id FROM creators ORDER BY user_id")
     await message.answer("👥 Есть доступ:\n" + "\n".join(f"<code>{r['user_id']}</code>" for r in rows))
 
 
+@dp.message(Command("give_access"))
+async def cmd_give_access(message: types.Message, command: CommandObject):
+    if message.from_user.id == ADMIN_ID and command.args and command.args.strip().isdigit():
+        await grant_access(message, int(command.args.strip()))
+
+
+@dp.message(Command("revoke_access"))
+async def cmd_revoke_access(message: types.Message, command: CommandObject):
+    if message.from_user.id == ADMIN_ID and command.args and command.args.strip().isdigit():
+        await revoke_access(message, int(command.args.strip()))
+
+
+@dp.message(Command("creators"))
+async def cmd_creators(message: types.Message):
+    if message.from_user.id == ADMIN_ID:
+        await list_creators(message)
+
+
 # ============================== Итоги / реролл ==============================
-async def run_draw(message: types.Message, gid: int, reroll: bool):
+async def run_draw(message: types.Message, user_id: int, gid: int, reroll: bool):
     pool = dp["pool"]
     g = await get_giveaway(pool, gid)
     if not g or g["kind"] != "normal":
         await message.answer("❌ Конкурс не найден.")
         return
-    if g["creator_id"] != message.from_user.id and message.from_user.id != ADMIN_ID:
+    if g["creator_id"] != user_id and user_id != ADMIN_ID:
         await message.answer("❌ Это не ваш конкурс.")
         return
     if not reroll and g["status"] == "finished":
@@ -414,7 +563,7 @@ async def cmd_finish(message: types.Message, command: CommandObject):
     if not command.args or not command.args.strip().isdigit():
         await message.answer("⚠️ Использование: <code>/finish ID</code>")
         return
-    await run_draw(message, int(command.args.strip()), reroll=False)
+    await run_draw(message, message.from_user.id, int(command.args.strip()), reroll=False)
 
 
 @dp.message(Command("reroll"))
@@ -424,7 +573,7 @@ async def cmd_reroll(message: types.Message, command: CommandObject):
     if not command.args or not command.args.strip().isdigit():
         await message.answer("⚠️ Использование: <code>/reroll ID</code>")
         return
-    await run_draw(message, int(command.args.strip()), reroll=True)
+    await run_draw(message, message.from_user.id, int(command.args.strip()), reroll=True)
 
 
 @dp.message(Command("my"))
@@ -494,13 +643,12 @@ async def process_prize_details(message: types.Message, state: FSMContext):
             return
         prize = f"{txt} Stars"
     else:
-        if not re.fullmatch(r"(https?://)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/\S*)?", txt):
-            await message.answer("⚠️ Это не ссылка. Отправьте ссылку на NFT, например:\n"
-                                 "<code>https://tg.catup.lol/nft/lolpop-14</code>")
+        m = re.fullmatch(r"(?:https?://)?tg\.catup\.lol/nft/([A-Za-z0-9_-]+)/?", txt, re.IGNORECASE)
+        if not m:
+            await message.answer("⚠️ Нужна ссылка на NFT вида:\n"
+                                 "<code>tg.catup.lol/nft/lolpop-14</code>")
             return
-        if not txt.startswith("http"):
-            txt = "https://" + txt
-        prize = f"NFT ({txt})"
+        prize = f"NFT (https://tg.catup.lol/nft/{m.group(1)})"
 
     if data["mode"] == "fast":
         async with dp["pool"].acquire() as conn:
