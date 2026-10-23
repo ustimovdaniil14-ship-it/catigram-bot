@@ -1,6 +1,7 @@
 import asyncio
 import random
 import asyncpg
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -13,7 +14,7 @@ from aiogram.types import BotCommand
 
 # ================= Настройки =================
 BOT_TOKEN = "1780243771:Gb_eq0_l0bqdqxSG5aU1zTnkyVSUjHnETPp"
-ADMIN_ID = 1780243247  # Твой актуальный Telegram ID главного администратора
+ADMIN_ID = 1780243247  # Твой главный Telegram ID
 ADMIN_USERNAME = "@Pavelmanager"
 
 PRICE_STARS = 600  # Цена доступа
@@ -64,7 +65,7 @@ async def init_db(pool):
                 prize_details TEXT
             );
         """)
-        # Автоматически добавляем твой ID в создатели при запуске
+        # Автоматически добавляем твой ID в создатели
         await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", ADMIN_ID)
 
 async def is_creator(pool, user_id):
@@ -76,10 +77,8 @@ async def is_creator(pool, user_id):
 
 async def add_creator(pool, user_id):
     async with pool.acquire() as conn:
-        # Проверяем, был ли уже доступ
         row = await conn.fetchrow("SELECT user_id FROM creators WHERE user_id = $1", user_id)
         exists = row is not None
-        
         await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", user_id)
         return exists
 
@@ -117,6 +116,18 @@ async def claim_fast_click(pool, giveaway_id, user_id, username):
         )
         return "win", prize_details, creator_id
 
+# --- Веб-сервер-заглушка для Render (чтобы статус всегда был Live) ---
+async def handle_ping(request):
+    return web.Response(text="Bot is alive!")
+
+async def start_dummy_server():
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 10000)
+    await site.start()
+
 # --- Главное меню ---
 async def set_main_menu(bot: Bot):
     commands = [
@@ -140,7 +151,7 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     user_id = message.from_user.id
     args = command.args
 
-    # Обработка клика в Фаст-Клике
+    # Фаст-клик клик
     if args and args.startswith("fast_"):
         giveaway_id = int(args.split("_")[1])
         status, prize, creator_id = await claim_fast_click(pool, giveaway_id, user_id, message.from_user.username)
@@ -171,7 +182,7 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             await message.answer("⚠️ Розыгрыш не найден или завершён.")
         return
 
-    # Обработка участия в обычном конкурсе (кнопка остается активной у всех)
+    # Обычный конкурс (кнопка активна у всех)
     if args and args.startswith("join_"):
         giveaway_id = int(args.split("_")[1])
         success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
@@ -412,6 +423,9 @@ async def main():
     pool = await get_db_pool()
     await init_db(pool)
     dp["pool"] = pool
+    
+    # Запуск заглушки порта для Render
+    await start_dummy_server()
     
     await set_main_menu(bot)
     print("🤖 Бот запущен!")
