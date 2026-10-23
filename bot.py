@@ -231,7 +231,8 @@ async def do_join(user: types.User, gid: int, reply):
             return
         if not ok:
             kb = InlineKeyboardBuilder()
-            kb.button(text="📢 Открыть канал", url=f"https://t.me/{g['channel_username'].lstrip('@')}")
+            if g["channel_username"].startswith("@"):
+                kb.button(text="📢 Открыть канал", url=f"{LINK_BASE}/{g['channel_username'].lstrip('@')}")
             kb.button(text="✅ Я подписался", callback_data=f"check_{gid}")
             kb.adjust(1)
             await reply(f"❌ Сначала подпишитесь на {esc(g['channel_username'])}, затем нажмите кнопку.",
@@ -563,41 +564,57 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         await state.clear()
     else:
         await state.update_data(prize=prize)
-        await message.answer("Введите юзернейм канала (например, <code>@PavelBet</code>).\n"
+        await message.answer("Перешлите сюда <b>любой пост из вашего канала</b>.\n"
                              "⚠️ Бот должен быть <b>администратором</b> этого канала — иначе проверка подписки не работает.")
         await state.set_state(GiveawayForm.channel_username)
 
 
 @dp.message(GiveawayForm.channel_username)
 async def process_channel(message: types.Message, state: FSMContext):
-    ch = (message.text or "").strip()
-    if not re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,31}", ch):
-        await message.answer("⚠️ Неверный формат! Пример: <code>@PavelBet</code>")
-        return
-    try:
-        chat = await bot.get_chat(chat_id=ch)
-    except TelegramAPIError as e:
-        log.warning("get_chat(%s) failed: %s", ch, e)
-        await message.answer(f"❌ Канал не найден или бот его не видит.\n"
-                             f"Добавьте бота админом в канал и отправьте юзернейм снова.\n\n"
-                             f"Ошибка: <code>{esc(str(e))}</code>")
-        return
-    if chat.type != "channel":
-        await message.answer("❌ Это не канал! Укажите юзернейм канала:")
-        return
+    origin = getattr(message, "forward_origin", None)
+    fchat = getattr(origin, "chat", None) if origin else None
+    if fchat is None:
+        fchat = getattr(message, "forward_from_chat", None)
+
+    chat_id = username = title = None
+    if fchat is not None:
+        if fchat.type != "channel":
+            await message.answer("❌ Это не канал. Перешлите пост из канала:")
+            return
+        chat_id, username, title = fchat.id, fchat.username, fchat.title
+    else:
+        txt = (message.text or "").strip()
+        if re.fullmatch(r"-100\d{5,}", txt):
+            chat_id = int(txt)
+        elif re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,31}", txt):
+            try:
+                chat = await bot.get_chat(chat_id=txt)
+                chat_id, username, title = chat.id, chat.username, chat.title
+            except TelegramAPIError as e:
+                await message.answer("❌ Сервер не находит канал по юзернейму.\n"
+                                     "Просто <b>перешлите сюда любой пост</b> из канала.\n\n"
+                                     f"Ошибка: <code>{esc(str(e))}</code>")
+                return
+        else:
+            await message.answer("⚠️ Перешлите сюда любой пост из канала (или отправьте ID вида <code>-100123...</code>):")
+            return
+
     try:
         me = await bot.get_me()
-        bm = await bot.get_chat_member(chat_id=chat.id, user_id=me.id)
+        bm = await bot.get_chat_member(chat_id=chat_id, user_id=me.id)
         if bm.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-            raise ValueError
-    except (TelegramAPIError, ValueError):
-        await message.answer("❌ Бот не админ в этом канале. Добавьте его администратором и отправьте юзернейм снова:")
+            raise ValueError("not admin")
+    except (TelegramAPIError, ValueError) as e:
+        await message.answer("❌ Бот не админ в этом канале или не может с ним работать.\n"
+                             f"Ошибка: <code>{esc(str(e))}</code>")
         return
 
-    await state.update_data(channel_id=chat.id, channel_username=ch)
+    label = f"@{username}" if username else (title or str(chat_id))
+    await state.update_data(channel_id=chat_id, channel_username=label)
     kb = InlineKeyboardBuilder()
     kb.button(text="⏭ Пропустить (только подписка)", callback_data="skip_conditions")
-    await message.answer("Укажите дополнительные условия (или нажмите кнопку):", reply_markup=kb.as_markup())
+    await message.answer(f"✅ Канал: <b>{esc(label)}</b>\n\nУкажите дополнительные условия (или нажмите кнопку):",
+                         reply_markup=kb.as_markup())
     await state.set_state(GiveawayForm.conditions)
 
 
