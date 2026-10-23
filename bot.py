@@ -492,17 +492,19 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         )
         await state.set_state(GiveawayForm.channel_username)
 
-# Жёсткая проверка канала: проверяем реально ли он существует в Telegram
+# Строгая проверка канала: отсекаем мусор и проверяем через API
 @dp.message(GiveawayForm.channel_username)
 async def process_channel(message: types.Message, state: FSMContext):
     channel_input = message.text.strip()
     
-    if not channel_input.startswith("@"):
-        await message.answer("⚠️ Юзернейм канала должен начинаться с символа `@` (например, `@PavelBet`). Попробуйте еще раз:")
+    if not channel_input.startswith("@") or len(channel_input) < 4:
+        await message.answer(
+            "⚠️ **Неверный формат!**\n"
+            "Юзернейм канала должен начинаться с символа `@` и содержать хотя бы пару символов (например, `@PavelBet`). Попробуйте еще раз:"
+        )
         return
 
     try:
-        # Пытаемся получить информацию о чате/канале через API
         chat = await bot.get_chat(chat_id=channel_input)
         if chat.type != "channel":
             await message.answer("❌ Это не канал! Укажите именно юзернейм **канала**:")
@@ -510,7 +512,7 @@ async def process_channel(message: types.Message, state: FSMContext):
     except Exception:
         await message.answer(
             "❌ **Канал не найден!**\n"
-            "Такого канала не существует или юзернейм введен с ошибкой. Проверьте правильность и попробуйте снова:"
+            "Такого канала не существует или бот не имеет к нему доступа. Проверьте юзернейм и попробуйте снова:"
         )
         return
 
