@@ -24,7 +24,6 @@ DATABASE_URL = "postgresql://neondb_owner:npg_pWVDXMBAHT90@ep-jolly-heart-b5c4ag
 CATIGRAM_API_URL = "http://bot.catup.lol"
 # =============================================
 
-# Настройка API Catigram
 catigram_server = TelegramAPIServer.from_base(CATIGRAM_API_URL)
 session = AiohttpSession(api=catigram_server)
 bot = Bot(token=BOT_TOKEN, session=session)
@@ -59,12 +58,12 @@ async def init_db(pool):
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS fast_clicks (
                 giveaway_id INT PRIMARY KEY,
+                creator_id BIGINT,
                 winner_id BIGINT,
                 winner_username TEXT,
                 prize_details TEXT
             );
         """)
-        # Навсегда заносим главного админа
         await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", ADMIN_ID)
 
 async def is_creator(pool, user_id):
@@ -89,34 +88,35 @@ async def add_participant(pool, giveaway_id, user_id, username):
         except asyncpg.UniqueViolationError:
             return False
 
-async def create_fast_click(pool, giveaway_id, prize_details):
+async def create_fast_click(pool, giveaway_id, creator_id, prize_details):
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO fast_clicks (giveaway_id, prize_details) VALUES ($1, $2);",
-            giveaway_id, prize_details
+            "INSERT INTO fast_clicks (giveaway_id, creator_id, prize_details) VALUES ($1, $2, $3);",
+            giveaway_id, creator_id, prize_details
         )
 
 async def claim_fast_click(pool, giveaway_id, user_id, username):
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT winner_id, prize_details FROM fast_clicks WHERE giveaway_id = $1", giveaway_id)
+        row = await conn.fetchrow("SELECT creator_id, winner_id, prize_details FROM fast_clicks WHERE giveaway_id = $1", giveaway_id)
         if not row:
-            return "not_found", None
+            return "not_found", None, None
         
-        winner_id, prize_details = row["winner_id"], row["prize_details"]
+        creator_id, winner_id, prize_details = row["creator_id"], row["winner_id"], row["prize_details"]
         if winner_id is not None:
-            return "already_claimed", prize_details
+            return "already_claimed", prize_details, creator_id
         
         await conn.execute(
             "UPDATE fast_clicks SET winner_id = $1, winner_username = $2 WHERE giveaway_id = $3",
             user_id, username or "Без username", giveaway_id
         )
-        return "win", prize_details
+        return "win", prize_details, creator_id
 
 # --- Кнопка "Меню" ---
 async def set_main_menu(bot: Bot):
     commands = [
         BotCommand(command="start", description="Главное меню / Перезапуск"),
         BotCommand(command="new_giveaway", description="Создать новый конкурс"),
+        BotCommand(command="finish", description="Завершить конкурс: /finish ID"),
         BotCommand(command="myid", description="Узнать свой Telegram ID"),
     ]
     await bot.set_my_commands(commands)
@@ -134,24 +134,42 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     user_id = message.from_user.id
     args = command.args
 
-    # Фаст-клик
+    # Обработка Фаст-клика
     if args and args.startswith("fast_"):
         giveaway_id = int(args.split("_")[1])
-        status, prize = await claim_fast_click(pool, giveaway_id, user_id, message.from_user.username)
+        status, prize, creator_id = await claim_fast_click(pool, giveaway_id, user_id, message.from_user.username)
         
         if status == "win":
+            user_tg = f"@{message.from_user.username}" if message.from_user.username else "Без username"
+            
+            # Уведомление участнику
             await message.answer(
                 f"⚡️ **ПОЗДРАВЛЯЕМ! ТЫ БЫЛ ПЕРВЫМ!** ⚡️\n\n"
                 f"🎉 Ты успешно забрал приз: **{prize}**!\n"
-                f"Напиши администратору {ADMIN_USERNAME} для получения награды."
+                f"Организатор скоро свяжется с тобой."
             )
+            
+            # Отправка юзернейма создателю конкурса!
+            try:
+                await bot.send_message(
+                    chat_id=creator_id,
+                    text=(
+                        f"⚡️ **ФАСТ-КЛИК РОЗЫГРЫШ ЗАВЕРШЁН!** ⚡️\n\n"
+                        f"🏆 **Победитель:** {user_tg} (`ID: {user_id}`)\n"
+                        f"🎁 **Приз:** {prize}\n"
+                        f"📌 **ID конкурса:** `#{giveaway_id}`"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
         elif status == "already_claimed":
             await message.answer("❌ **К сожалению, ты не успел!** Этот приз уже забрал другой участник.")
         else:
             await message.answer("⚠️ Розыгрыш не найден или завершён.")
         return
 
-    # Обычный конкурс
+    # Обработка обычного конкурса
     if args and args.startswith("join_"):
         giveaway_id = int(args.split("_")[1])
         success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
@@ -170,7 +188,9 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             "👋 **Привет, Создатель!**\n\n"
             "У тебя есть доступ к созданию розыгрышей.\n"
             "Чтобы создать конкурс, используй команду:\n"
-            "👉 /new_giveaway"
+            "👉 /new_giveaway\n\n"
+            "Чтобы подвести итоги конкурса:\n"
+            "👉 `/finish <ID_конкурса>`"
         )
     else:
         builder = InlineKeyboardBuilder()
@@ -226,6 +246,37 @@ async def cmd_give_access(message: types.Message):
         except Exception:
             pass
 
+# --- Команда выбора победителя /finish <ID> ---
+@dp.message(Command("finish"))
+async def cmd_finish(message: types.Message):
+    pool = dp["pool"]
+    if not await is_creator(pool, message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("⚠️ Укажите ID розыгрыша. Пример: `/finish 123`", parse_mode="Markdown")
+        return
+
+    giveaway_id = int(args[1])
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, username FROM participants WHERE giveaway_id = $1", giveaway_id)
+
+    if not rows:
+        await message.answer(f"❌ В розыгрыше `#{giveaway_id}` пока нет участников!")
+        return
+
+    winner = random.choice(rows)
+    winner_username = f"@{winner['username']}" if winner['username'] != "Без username" else f"ID: {winner['user_id']}"
+
+    await message.answer(
+        f"🎉 **ИТОГИ РОЗЫГРЫША #{giveaway_id}** 🎉\n\n"
+        f"🏆 **Победитель:** {winner_username} (`ID: {winner['user_id']}`)\n"
+        f"👥 Всего участников: {len(rows)}\n\n"
+        f"💬 *Скопируйте этот текст и опубликуйте его в своём канале!*",
+        parse_mode="Markdown"
+    )
+
 # --- Конструктор розыгрышей ---
 @dp.message(Command("new_giveaway"))
 async def cmd_new_giveaway(message: types.Message, state: FSMContext):
@@ -249,7 +300,7 @@ async def process_mode(callback: types.CallbackQuery, state: FSMContext):
 
     builder = InlineKeyboardBuilder()
     builder.button(text="🖼 NFT", callback_data="type_nft")
-    builder.button(text="🎁 Обычный приз (Stars / Деньги)", callback_data="type_regular")
+    builder.button(text="🎁 Обычный приз (Stars)", callback_data="type_regular")
     builder.adjust(1)
 
     await callback.message.answer("Выберите тип приза:", reply_markup=builder.as_markup())
@@ -264,7 +315,7 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
     if prize_type == "NFT":
         await callback.message.answer("🔗 Отправьте ссылку на ваш **NFT**:")
     else:
-        await callback.message.answer("✏️ Напишите наименование приза (например: `500 Stars` или `10$`):")
+        await callback.message.answer("✏️ Напишите наименование приза (например: `500 Stars`):")
 
     await state.set_state(GiveawayForm.prize_details)
     await callback.answer()
@@ -283,19 +334,21 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         bot_info = await bot.get_me()
         bot_username = bot_info.username
 
-        await create_fast_click(pool, giveaway_id, f"{prize_type}: {prize_details}")
+        await create_fast_click(pool, giveaway_id, message.from_user.id, f"{prize_type}: {prize_details}")
         fast_link = f"https://tg.catup.lol/{bot_username}?start=fast_{giveaway_id}"
 
         text = (
             f"⚡️ **ФАСТ-КЛИК РОЗЫГРЫШ!** ⚡️\n\n"
             f"🎁 **Приз:** {prize_details}\n\n"
-            f"🚀 **Кто первый нажмёт на ссылку ниже, тот и забирает приз!**\n"
-            f"{fast_link}\n\n"
+            f"🚀 Кто первый нажмёт на кнопку ниже, тот и забирает приз!\n\n"
             f"⏱ *Победитель определяется мгновенно.*"
         )
 
-        await message.answer("⚡️ **Ваш Фаст-Клик конкурс готов! Срочно публикуйте его в канале:**")
-        await message.answer(text, parse_mode="Markdown")
+        builder = InlineKeyboardBuilder()
+        builder.button(text="⚡️ Забрать приз!", url=fast_link)
+
+        await message.answer(f"⚡️ **Ваш Фаст-Клик конкурс готов! (ID: `{giveaway_id}`) Перешлите пост в канал:**", parse_mode="Markdown")
+        await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
         await state.clear()
     else:
         await message.answer("📌 **Укажите условия для участия**\n(например: `Подписка на канал @mychannel`):")
@@ -320,18 +373,23 @@ async def process_conditions(message: types.Message, state: FSMContext):
         prize_text = f"🎁 **Приз:** {prize_details}"
 
     text = (
-        f"🎉 **РОЗЫГРЫШ!** 🎉\n\n"
+        f"🎉 **РОЗЫГРЫШ #{giveaway_id}** 🎉\n\n"
         f"{prize_text}\n"
         f"📌 **Условия участия:** {conditions}\n\n"
-        f"👥 **Для участия нажмите на ссылку ниже:**\n"
-        f"{join_link}\n\n"
         f"🏆 **Победителей:** 1\n"
-        f"⏰ **Окончание:** По решению организатора\n\n"
-        f"ℹ️ *Ваше участие автоматически фиксируется ботом после перехода по ссылке.*"
+        f"⏰ **Окончание:** По решению организатора"
     )
 
-    await message.answer("✅ **Ваш пост с конкурсом готов! Скопируйте и опубликуйте его в канале:**")
-    await message.answer(text, parse_mode="Markdown")
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🎉 Участвовать в розыгрыше", url=join_link)
+
+    await message.answer(
+        f"✅ **Ваш пост с конкурсом готов! (ID: `{giveaway_id}`)**\n"
+        f"Завершить конкурс и выбрать победителя: `/finish {giveaway_id}`\n\n"
+        f"Перешлите пост ниже в свой канал:",
+        parse_mode="Markdown"
+    )
+    await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
     await state.clear()
 
 # --- Запуск ---
@@ -341,7 +399,7 @@ async def main():
     dp["pool"] = pool
     
     await set_main_menu(bot)
-    print("🤖 Бот запущен с облачной базой Neon PostgreSQL!")
+    print("🤖 Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
