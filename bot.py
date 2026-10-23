@@ -1,597 +1,643 @@
 import asyncio
-import random
+import html
+import logging
+import os
+import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.client.telegram import TelegramAPIServer
+from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ================= Настройки =================
-BOT_TOKEN = "1780243771:Gb_eq0_l0bqdqxSG5aU1zTnkyVSUjHnETPp"
-ADMIN_ID = 1780243247  # Твой главный Telegram ID
-ADMIN_USERNAME = "@Pavelmanager"
+# ================= Настройки (из переменных окружения Render) =================
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+DATABASE_URL = os.environ["DATABASE_URL"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@Pavelmanager")
+PRICE_STARS = int(os.getenv("PRICE_STARS", "600"))
+CATIGRAM_API_URL = os.getenv("CATIGRAM_API_URL", "http://bot.catup.lol")
+LINK_BASE = os.getenv("LINK_BASE", "https://tg.catup.lol")
+PORT = int(os.getenv("PORT", "10000"))  # Render сам задаёт PORT
+# ==============================================================================
 
-PRICE_STARS = 600  # Цена доступа
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("giveaway")
 
-# Подключение к Neon PostgreSQL
-DATABASE_URL = "postgresql://neondb_owner:npg_pWVDXMBAHT90@ep-jolly-heart-b5c4ag91-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-
-CATIGRAM_API_URL = "http://bot.catup.lol"
-# =============================================
-
-catigram_server = TelegramAPIServer.from_base(CATIGRAM_API_URL)
-session = AiohttpSession(api=catigram_server)
-bot = Bot(token=BOT_TOKEN, session=session)
+session = AiohttpSession(api=TelegramAPIServer.from_base(CATIGRAM_API_URL))
+bot = Bot(
+    token=BOT_TOKEN,
+    session=session,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- Состояния ---
+esc = html.escape
+OK_STATUSES = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
+
+
 class GiveawayForm(StatesGroup):
-    mode = State()          
-    prize_type = State()    
-    prize_details = State() 
+    mode = State()
+    prize_type = State()
+    prize_details = State()
     channel_username = State()
-    conditions = State()    
+    conditions = State()
+
 
 class DonateForm(StatesGroup):
     amount = State()
 
-# --- База данных ---
+
+# ============================== База данных ==============================
+def clean_dsn(dsn: str) -> str:
+    """asyncpg не понимает channel_binding из строки Neon — убираем."""
+    p = urlsplit(dsn)
+    q = [(k, v) for k, v in parse_qsl(p.query) if k != "channel_binding"]
+    return urlunsplit((p.scheme, p.netloc, p.path, urlencode(q), p.fragment))
+
+
 async def get_db_pool():
-    return await asyncpg.create_pool(DATABASE_URL)
+    # statement_cache_size=0 обязателен для pooler-эндпоинта Neon (pgbouncer)
+    return await asyncpg.create_pool(
+        clean_dsn(DATABASE_URL),
+        min_size=1,
+        max_size=5,
+        statement_cache_size=0,
+        max_inactive_connection_lifetime=60,
+    )
+
 
 async def init_db(pool):
     async with pool.acquire() as conn:
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS creators (
-                user_id BIGINT PRIMARY KEY
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS participants (
-                giveaway_id INT,
-                user_id BIGINT,
-                username TEXT,
-                ticket_number INT,
-                PRIMARY KEY (giveaway_id, user_id)
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS giveaway_channels (
-                giveaway_id INT PRIMARY KEY,
-                channel_id TEXT
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS fast_clicks (
-                giveaway_id INT PRIMARY KEY,
-                creator_id BIGINT,
+            CREATE TABLE IF NOT EXISTS creators (user_id BIGINT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS giveaways (
+                id SERIAL PRIMARY KEY,
+                creator_id BIGINT NOT NULL,
+                kind TEXT NOT NULL,               -- normal / fast
+                prize TEXT NOT NULL,
+                conditions TEXT,
+                channel_id BIGINT,
+                channel_username TEXT,
+                status TEXT NOT NULL DEFAULT 'active',  -- active / finished
+                next_ticket INT NOT NULL DEFAULT 1,
                 winner_id BIGINT,
                 winner_username TEXT,
-                prize_details TEXT
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE TABLE IF NOT EXISTS giveaway_participants (
+                giveaway_id INT NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL,
+                username TEXT,
+                ticket_number INT NOT NULL,
+                won BOOLEAN NOT NULL DEFAULT FALSE,
+                PRIMARY KEY (giveaway_id, user_id),
+                UNIQUE (giveaway_id, ticket_number)
+            );
+            CREATE TABLE IF NOT EXISTS payments (
+                charge_id TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                payload TEXT NOT NULL,
+                amount INT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         """)
-        await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", ADMIN_ID)
+        await conn.execute(
+            "INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING", ADMIN_ID
+        )
 
-async def is_creator(pool, user_id):
+
+async def is_creator(pool, user_id) -> bool:
     if user_id == ADMIN_ID:
         return True
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT user_id FROM creators WHERE user_id = $1", user_id)
-        return row is not None
+        return await conn.fetchval("SELECT 1 FROM creators WHERE user_id=$1", user_id) is not None
 
-async def add_creator(pool, user_id):
+
+async def add_creator(pool, user_id) -> bool:
+    """Возвращает True, если доступ уже был."""
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT user_id FROM creators WHERE user_id = $1", user_id)
-        exists = row is not None
-        await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", user_id)
-        return exists
+        res = await conn.execute(
+            "INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+        )
+        return res.endswith(" 0")
 
-async def add_participant_with_ticket(pool, giveaway_id, user_id, username):
+
+async def get_giveaway(pool, gid):
     async with pool.acquire() as conn:
-        existing = await conn.fetchrow(
-            "SELECT ticket_number FROM participants WHERE giveaway_id = $1 AND user_id = $2",
-            giveaway_id, user_id
-        )
-        if existing:
-            return existing["ticket_number"], False
+        return await conn.fetchrow("SELECT * FROM giveaways WHERE id=$1", gid)
 
-        max_ticket = await conn.fetchval(
-            "SELECT MAX(ticket_number) FROM participants WHERE giveaway_id = $1",
-            giveaway_id
-        )
-        next_ticket = (max_ticket or 0) + 1
 
-        await conn.execute(
-            "INSERT INTO participants (giveaway_id, user_id, username, ticket_number) VALUES ($1, $2, $3, $4);",
-            giveaway_id, user_id, username or "Без username", next_ticket
-        )
-        return next_ticket, True
-
-async def create_fast_click(pool, giveaway_id, creator_id, prize_details):
+async def add_participant(pool, gid, user_id, username):
+    """Атомарно выдаёт следующий номер билета (без гонок)."""
     async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO fast_clicks (giveaway_id, creator_id, prize_details) VALUES ($1, $2, $3);",
-            giveaway_id, creator_id, prize_details
-        )
+        async with conn.transaction():
+            await conn.fetchval("SELECT id FROM giveaways WHERE id=$1 FOR UPDATE", gid)
+            existing = await conn.fetchval(
+                "SELECT ticket_number FROM giveaway_participants WHERE giveaway_id=$1 AND user_id=$2",
+                gid, user_id,
+            )
+            if existing:
+                return existing, False
+            ticket = await conn.fetchval(
+                "UPDATE giveaways SET next_ticket = next_ticket + 1 WHERE id=$1 "
+                "RETURNING next_ticket - 1", gid,
+            )
+            await conn.execute(
+                "INSERT INTO giveaway_participants (giveaway_id, user_id, username, ticket_number) "
+                "VALUES ($1,$2,$3,$4)", gid, user_id, username, ticket,
+            )
+            return ticket, True
 
-async def claim_fast_click(pool, giveaway_id, user_id, username):
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT creator_id, winner_id, prize_details FROM fast_clicks WHERE giveaway_id = $1", giveaway_id)
-        if not row:
-            return "not_found", None, None
-        
-        creator_id, winner_id, prize_details = row["creator_id"], row["winner_id"], row["prize_details"]
-        if winner_id is not None:
-            return "already_claimed", prize_details, creator_id
-        
-        await conn.execute(
-            "UPDATE fast_clicks SET winner_id = $1, winner_username = $2 WHERE giveaway_id = $3",
-            user_id, username or "Без username", giveaway_id
-        )
-        return "win", prize_details, creator_id
 
-# --- Веб-сервер-заглушка для Render ---
+# ============================== Утилиты ==============================
+def mention(user_id, username) -> str:
+    if username:
+        return f"@{esc(username)}"
+    return f'<a href="tg://user?id={user_id}">ID {user_id}</a>'
+
+
+def parse_arg(args, prefix):
+    m = re.fullmatch(rf"{prefix}_(\d+)", args or "")
+    return int(m.group(1)) if m else None
+
+
+async def is_subscribed(channel_id: int, user_id: int) -> bool:
+    """Бросает TelegramAPIError, если проверить нельзя (бот не админ канала и т.п.)."""
+    member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+    if member.status in OK_STATUSES:
+        return True
+    if member.status == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(member, "is_member", False))
+    return False
+
+
+# ============================== Мини веб-сервер для Render ==============================
 async def handle_ping(request):
     return web.Response(text="Bot is alive!")
 
+
 async def start_dummy_server():
     app = web.Application()
-    app.router.add_get('/', handle_ping)
+    app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 10000)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
 
-# --- Главное меню ---
+
 async def set_main_menu(bot: Bot):
-    commands = [
-        BotCommand(command="start", description="Главное меню / Перезапуск"),
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Главное меню"),
         BotCommand(command="new_giveaway", description="Создать новый конкурс"),
+        BotCommand(command="my", description="Мои конкурсы"),
         BotCommand(command="finish", description="Итоги: /finish ID"),
         BotCommand(command="reroll", description="Переролл: /reroll ID"),
         BotCommand(command="myid", description="Узнать свой Telegram ID"),
-    ]
-    await bot.set_my_commands(commands)
+    ])
 
-# --- Хэндлеры ---
 
+# ============================== Старт / участие ==============================
 @dp.message(Command("myid"))
 async def cmd_myid(message: types.Message):
-    await message.answer(f"🆔 Твой Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
+    await message.answer(f"🆔 Твой Telegram ID: <code>{message.from_user.id}</code>")
+
+
+async def do_join(user: types.User, gid: int, reply):
+    pool = dp["pool"]
+    g = await get_giveaway(pool, gid)
+    if not g or g["kind"] != "normal":
+        await reply("⚠️ Розыгрыш не найден.")
+        return
+    if g["status"] != "active":
+        await reply("🔒 Этот конкурс уже завершён.")
+        return
+
+    if g["channel_id"]:
+        try:
+            ok = await is_subscribed(g["channel_id"], user.id)
+        except TelegramAPIError as e:
+            log.warning("Не могу проверить подписку (giveaway %s): %s", gid, e)
+            await reply("⚠️ Не могу проверить подписку. Сообщите организатору: бот должен быть админом канала.")
+            return
+        if not ok:
+            kb = InlineKeyboardBuilder()
+            kb.button(text="📢 Открыть канал", url=f"https://t.me/{g['channel_username'].lstrip('@')}")
+            kb.button(text="✅ Я подписался", callback_data=f"check_{gid}")
+            kb.adjust(1)
+            await reply(f"❌ Сначала подпишитесь на {esc(g['channel_username'])}, затем нажмите кнопку.",
+                        reply_markup=kb.as_markup())
+            return
+
+    ticket, is_new = await add_participant(pool, gid, user.id, user.username)
+    if is_new:
+        await reply(f"🎉 Вы успешно участвуете! Ваш номер: <b>#{ticket}</b>")
+    else:
+        await reply(f"ℹ️ Вы уже зарегистрированы. Ваш номер: <b>#{ticket}</b>")
+
+
+@dp.callback_query(F.data.startswith("check_"))
+async def check_sub_callback(callback: types.CallbackQuery):
+    gid = parse_arg(callback.data, "check")
+    await callback.answer()
+    if gid is not None:
+        await do_join(callback.from_user, gid, callback.message.answer)
+
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
     await state.clear()
     pool = dp["pool"]
-    user_id = message.from_user.id
+    user = message.from_user
     args = command.args
 
-    if args and args.startswith("fast_"):
-        giveaway_id = int(args.split("_")[1])
-        status, prize, creator_id = await claim_fast_click(pool, giveaway_id, user_id, message.from_user.username)
-        
-        if status == "win":
-            user_tg = f"@{message.from_user.username}" if message.from_user.username else "Без username"
-            await message.answer(
-                f"⚡️ **ПОЗДРАВЛЯЕМ! ТЫ БЫЛ ПЕРВЫМ!** ⚡️\n\n"
-                f"🎉 Ты успешно забрал приз: **{prize}**!\n"
-                f"Организатор скоро свяжется с тобой."
+    gid = parse_arg(args, "fast")
+    if gid is not None:
+        async with pool.acquire() as conn:
+            g = await conn.fetchrow("SELECT creator_id, prize FROM giveaways WHERE id=$1 AND kind='fast'", gid)
+            if not g:
+                await message.answer("⚠️ Розыгрыш не найден.")
+                return
+            if g["creator_id"] == user.id:
+                await message.answer("🙅 Создатель не может участвовать в своём фаст-клике.")
+                return
+            # Атомарно: только один пользователь сможет выставить winner_id
+            won = await conn.fetchrow(
+                "UPDATE giveaways SET winner_id=$2, winner_username=$3, status='finished' "
+                "WHERE id=$1 AND winner_id IS NULL RETURNING prize, creator_id",
+                gid, user.id, user.username,
             )
+        if won:
+            await message.answer(f"⚡️ <b>ПОЗДРАВЛЯЕМ! ТЫ БЫЛ ПЕРВЫМ!</b>\n\nПриз: <b>{esc(won['prize'])}</b>")
             try:
                 await bot.send_message(
-                    chat_id=creator_id,
-                    text=(
-                        f"⚡️ **ФАСТ-КЛИК РОЗЫГРЫШ ЗАВЕРШЁН!** ⚡️\n\n"
-                        f"🏆 **Победитель:** {user_tg} (`ID: {user_id}`)\n"
-                        f"🎁 **Приз:** {prize}\n"
-                        f"📌 **ID конкурса:** `#{giveaway_id}`"
-                    ),
-                    parse_mode="Markdown"
+                    won["creator_id"],
+                    f"⚡️ Фаст-клик #{gid} выиграл {mention(user.id, user.username)} (<code>{user.id}</code>)",
                 )
-            except Exception:
+            except TelegramAPIError:
                 pass
-        elif status == "already_claimed":
-            await message.answer("❌ **К сожалению, ты не успел!** Этот приз уже забрал другой участник.")
         else:
-            await message.answer("⚠️ Розыгрыш не найден или завершён.")
+            await message.answer("❌ К сожалению, этот приз уже забрали!")
         return
 
-    if args and args.startswith("join_"):
-        giveaway_id = int(args.split("_")[1])
-        
-        async with pool.acquire() as conn:
-            ch_row = await conn.fetchrow("SELECT channel_id FROM giveaway_channels WHERE giveaway_id = $1", giveaway_id)
-        
-        if ch_row:
-            channel_id = ch_row["channel_id"]
-            try:
-                member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
-                if member.status in ["left", "kicked"]:
-                    await message.answer(
-                        "❌ **Вы не подписаны на канал!**\n\n"
-                        f"Чтобы принять участие, подпишитесь на канал {channel_id} и перейдите по ссылке розыгрыша снова."
-                    )
-                    return
-            except Exception:
-                pass
-
-        ticket_number, is_new = await add_participant_with_ticket(pool, giveaway_id, user_id, message.from_user.username)
-        if is_new:
-            await message.answer(
-                f"🎉 **Ты успешно участвуешь в розыгрыше!**\n"
-                f"🎟 Твой порядковый номер: **#{ticket_number}**"
-            )
-        else:
-            await message.answer(f"ℹ️ Ты уже зарегистрирован в этом розыгрыше! Твой номер: **#{ticket_number}**")
+    gid = parse_arg(args, "join")
+    if gid is not None:
+        await do_join(user, gid, message.answer)
         return
 
-    if await is_creator(pool, user_id):
-        builder = InlineKeyboardBuilder()
-        builder.button(text="💖 Поддержать автора (Пожертвование)", callback_data="donate_stars")
-        
-        await message.answer(
-            "👋 **Привет, Создатель!**\n\n"
-            "У тебя есть доступ к созданию розыгрышей.\n"
-            "👉 /new_giveaway — Создать конкурс\n"
-            "👉 `/finish <ID>` — Подвести итоги\n"
-            "👉 `/reroll <ID>` — Перевыбрать победителя",
-            reply_markup=builder.as_markup()
-        )
+    if await is_creator(pool, user.id):
+        kb = InlineKeyboardBuilder()
+        kb.button(text="💖 Поддержать автора", callback_data="donate_stars")
+        await message.answer("👋 Привет, Создатель!\nИспользуй /new_giveaway для создания конкурса.",
+                             reply_markup=kb.as_markup())
     else:
-        builder = InlineKeyboardBuilder()
-        builder.button(text=f"⭐️ Купить доступ — {PRICE_STARS} ⭐️", callback_data="buy_access")
-        builder.button(text="💖 Пожертвовать звёзды", callback_data="donate_stars")
-        builder.button(text=f"💬 Написать {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME.replace('@', '')}")
-        builder.adjust(1)
+        kb = InlineKeyboardBuilder()
+        kb.button(text=f"⭐️ Купить доступ — {PRICE_STARS}", callback_data="buy_access")
+        kb.button(text="💖 Пожертвовать звёзды", callback_data="donate_stars")
+        kb.button(text=f"💬 Написать {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME.lstrip('@')}")
+        kb.adjust(1)
+        await message.answer("🔒 Доступ закрыт. Оплатите звёзды или напишите админу.", reply_markup=kb.as_markup())
 
-        await message.answer(
-            "🔒 **Доступ закрыт**\n\n"
-            f"Чтобы получить доступ к созданию и публикации розыгрышей, напиши администратору {ADMIN_USERNAME} в личные сообщения или оплатите ⭐️ {PRICE_STARS} кнопкой ниже.\n\n"
-            "После оплаты доступ откроется автоматически!",
-            reply_markup=builder.as_markup()
-        )
 
-# --- Донаты ---
+# ============================== Оплата / донаты ==============================
 @dp.callback_query(F.data == "donate_stars")
 async def start_donate(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("💖 **Пожертвование автору**\n\nВведите количество звёзд ⭐️ (**только цифрами**, например: `50`, `100`):")
+    await callback.message.answer("Введите количество звёзд для пожертвования (только цифры):")
     await state.set_state(DonateForm.amount)
     await callback.answer()
 
+
 @dp.message(DonateForm.amount)
 async def process_donate_amount(message: types.Message, state: FSMContext):
-    text_input = message.text.strip() if message.text else ""
-    if not text_input.isdigit() or int(text_input) <= 0:
-        await message.answer("⚠️ Ошибка! Введите корректное число звёзд:")
+    txt = (message.text or "").strip()
+    if not txt.isdigit() or not (0 < int(txt) <= 100000):
+        await message.answer("⚠️ Введите корректное число:")
         return
-
-    amount = int(text_input)
-    prices = [types.LabeledPrice(label="Пожертвование проекту", amount=amount)]
-    
+    amount = int(txt)
     await bot.send_invoice(
-        chat_id=message.from_user.id,
-        title="Пожертвование автору 💖",
-        description=f"Добровольное пожертвование в размере {amount} Telegram Stars.",
-        payload=f"donate_{message.from_user.id}",
-        currency="XTR",
-        prices=prices,
-        provider_token=""
+        chat_id=message.from_user.id, title="Донат", description=f"Пожертвование {amount} звёзд",
+        payload=f"donate_{message.from_user.id}", currency="XTR",
+        prices=[types.LabeledPrice(label="Пожертвование", amount=amount)], provider_token="",
     )
     await state.clear()
 
+
 @dp.callback_query(F.data == "buy_access")
 async def buy_access_callback(callback: types.CallbackQuery):
-    prices = [types.LabeledPrice(label="Доступ к созданию розыгрышей", amount=PRICE_STARS)]
     await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title="Доступ к боту",
-        description="Покупка доступа к созданию и публикации розыгрышей.",
-        payload=f"access_{callback.from_user.id}",
-        currency="XTR",
-        prices=prices,
-        provider_token=""
+        chat_id=callback.from_user.id, title="Доступ к боту", description="Покупка доступа",
+        payload=f"access_{callback.from_user.id}", currency="XTR",
+        prices=[types.LabeledPrice(label="Доступ", amount=PRICE_STARS)], provider_token="",
     )
     await callback.answer()
 
+
 @dp.pre_checkout_query()
-async def pre_checkout_handler(pre_checkout_query: types.PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+async def pre_checkout_handler(q: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(q.id, ok=True)
+
 
 @dp.message(F.successful_payment)
 async def payment_success(message: types.Message):
     pool = dp["pool"]
-    payload = message.successful_payment.invoice_payload
-    if payload.startswith("donate_"):
-        await message.answer("💖 **Огромное спасибо за вашу поддержку!**")
+    sp = message.successful_payment
+    async with pool.acquire() as conn:
+        inserted = await conn.execute(
+            "INSERT INTO payments (charge_id, user_id, payload, amount) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT DO NOTHING",
+            sp.telegram_payment_charge_id, message.from_user.id, sp.invoice_payload, sp.total_amount,
+        )
+    if inserted.endswith(" 0"):  # повторная доставка того же платежа
+        return
+    if sp.invoice_payload.startswith("donate_"):
+        await message.answer("💖 Спасибо за поддержку!")
     else:
         await add_creator(pool, message.from_user.id)
-        await message.answer("🎉 **Оплата прошла успешно!** Теперь тебе доступно создание розыгрышей.")
+        await message.answer("🎉 Оплата успешна! Доступ открыт. Используйте /new_giveaway")
+
 
 @dp.message(Command("give_access"))
-async def cmd_give_access(message: types.Message):
+async def cmd_give_access(message: types.Message, command: CommandObject):
     if message.from_user.id != ADMIN_ID:
         return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("Использование: <code>/give_access ID</code>")
+        return
+    target = int(command.args.strip())
+    if await add_creator(dp["pool"], target):
+        await message.answer(f"ℹ️ У пользователя <code>{target}</code> уже был доступ.")
+        return
+    await message.answer(f"✅ Доступ выдан пользователю <code>{target}</code>!")
+    try:
+        await bot.send_message(target, f"🎉 Администратор {esc(ADMIN_USERNAME)} выдал вам бесплатный доступ! "
+                                       f"Используйте /new_giveaway")
+    except TelegramAPIError:
+        pass
+
+
+@dp.message(Command("revoke_access"))
+async def cmd_revoke_access(message: types.Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if not command.args or not command.args.strip().isdigit() or int(command.args) == ADMIN_ID:
+        await message.answer("Использование: <code>/revoke_access ID</code>")
+        return
+    async with dp["pool"].acquire() as conn:
+        await conn.execute("DELETE FROM creators WHERE user_id=$1", int(command.args))
+    await message.answer("✅ Доступ отозван.")
+
+
+# ============================== Итоги / реролл ==============================
+async def run_draw(message: types.Message, gid: int, reroll: bool):
     pool = dp["pool"]
-    args = message.text.split()
-    if len(args) > 1 and args[1].isdigit():
-        target_id = int(args[1])
-        already_had = await add_creator(pool, target_id)
-        
-        if already_had:
-            await message.answer(f"ℹ️ У пользователя `{target_id}` **уже был** бесплатный доступ ранее.")
-        else:
-            await message.answer(f"✅ Бесплатный доступ **успешно выдан** пользователю `{target_id}`!")
+    g = await get_giveaway(pool, gid)
+    if not g or g["kind"] != "normal":
+        await message.answer("❌ Конкурс не найден.")
+        return
+    if g["creator_id"] != message.from_user.id and message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Это не ваш конкурс.")
+        return
+
+    if not reroll and g["status"] == "finished":
+        w = mention(g["winner_id"], g["winner_username"]) if g["winner_id"] else "—"
+        await message.answer(f"ℹ️ Конкурс #{gid} уже завершён. Победитель: 🏆 {w}\n"
+                             f"Для нового победителя: <code>/reroll {gid}</code>")
+        return
+    if reroll and g["status"] != "finished":
+        await message.answer(f"ℹ️ Сначала завершите конкурс: <code>/finish {gid}</code>")
+        return
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, username, ticket_number FROM giveaway_participants "
+            "WHERE giveaway_id=$1 AND NOT won ORDER BY random()", gid)
+
+    winner = None
+    for r in rows:
+        if g["channel_id"]:
             try:
-                await bot.send_message(
-                    target_id, 
-                    f"🎉 Главный администратор {ADMIN_USERNAME} выдал вам бесплатный доступ к созданию розыгрышей навсегда!\n\n"
-                    f"Используйте команду /new_giveaway для создания первого конкурса."
-                )
-            except Exception:
-                pass
-    else:
-        await message.answer("⚠️ Укажите ID. Пример: `/give_access 123456789`", parse_mode="Markdown")
+                if not await is_subscribed(g["channel_id"], r["user_id"]):
+                    continue  # отписался — пропускаем
+            except TelegramAPIError as e:
+                log.warning("Проверка подписки при розыгрыше #%s: %s", gid, e)
+                await message.answer("⚠️ Не могу проверить подписки. Бот должен быть админом канала.")
+                return
+        winner = r
+        break
+
+    if not winner:
+        await message.answer(f"❌ Нет подходящих участников в конкурсе #{gid}.")
+        return
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("UPDATE giveaway_participants SET won=TRUE WHERE giveaway_id=$1 AND user_id=$2",
+                               gid, winner["user_id"])
+            await conn.execute("UPDATE giveaways SET status='finished', winner_id=$2, winner_username=$3 "
+                               "WHERE id=$1", gid, winner["user_id"], winner["username"])
+
+    title = "🔄 Новый победитель" if reroll else "🎉 Победитель розыгрыша"
+    await message.answer(f"{title} #{gid}:\n🏆 {mention(winner['user_id'], winner['username'])} "
+                         f"(Билет #{winner['ticket_number']})\n🎁 Приз: {esc(g['prize'])}")
+    try:
+        await bot.send_message(winner["user_id"], f"🏆 Вы победили в конкурсе #{gid}!\nПриз: {esc(g['prize'])}\n"
+                                                  f"Свяжитесь с организатором.")
+    except TelegramAPIError:
+        pass
+
 
 @dp.message(Command("finish"))
-async def cmd_finish(message: types.Message):
-    pool = dp["pool"]
-    if not await is_creator(pool, message.from_user.id):
+async def cmd_finish(message: types.Message, command: CommandObject):
+    if not await is_creator(dp["pool"], message.from_user.id):
         return
-
-    args = message.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        await message.answer("⚠️ Укажите ID розыгрыша. Пример: `/finish 123`", parse_mode="Markdown")
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("⚠️ Использование: <code>/finish ID</code>")
         return
+    await run_draw(message, int(command.args.strip()), reroll=False)
 
-    giveaway_id = int(args[1])
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT user_id, username, ticket_number FROM participants WHERE giveaway_id = $1", giveaway_id)
-
-    if not rows:
-        await message.answer(f"❌ В розыгрыше `#{giveaway_id}` пока нет участников!")
-        return
-
-    winner = random.choice(rows)
-    winner_username = f"@{winner['username']}" if winner['username'] != "Без username" else f"ID: {winner['user_id']}"
-
-    await message.answer(
-        f"🎉 **ИТОГИ РОЗЫГРЫША #{giveaway_id}** 🎉\n\n"
-        f"🏆 **Победитель:** {winner_username} (Номер билета: **#{winner['ticket_number']}**)\n"
-        f"👥 Всего участников: {len(rows)}\n\n"
-        f"💬 *Скопируйте этот текст и опубликуйте его в своём канале!*",
-        parse_mode="Markdown"
-    )
 
 @dp.message(Command("reroll"))
-async def cmd_reroll(message: types.Message):
+async def cmd_reroll(message: types.Message, command: CommandObject):
+    if not await is_creator(dp["pool"], message.from_user.id):
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.answer("⚠️ Использование: <code>/reroll ID</code>")
+        return
+    await run_draw(message, int(command.args.strip()), reroll=True)
+
+
+@dp.message(Command("my"))
+async def cmd_my(message: types.Message):
     pool = dp["pool"]
     if not await is_creator(pool, message.from_user.id):
         return
-
-    args = message.text.split()
-    if len(args) < 2 or not args[1].isdigit():
-        await message.answer("⚠️ Укажите ID розыгрыша для реролла. Пример: `/reroll 123`", parse_mode="Markdown")
-        return
-
-    giveaway_id = int(args[1])
     async with pool.acquire() as conn:
-        if len(args) > 2 and args[2].isdigit():
-            old_winner_id = int(args[2])
-            await conn.execute("DELETE FROM participants WHERE giveaway_id = $1 AND user_id = $2", giveaway_id, old_winner_id)
-
-        rows = await conn.fetch("SELECT user_id, username, ticket_number FROM participants WHERE giveaway_id = $1", giveaway_id)
-
+        rows = await conn.fetch(
+            "SELECT g.id, g.kind, g.prize, g.status, "
+            "(SELECT count(*) FROM giveaway_participants p WHERE p.giveaway_id=g.id) AS cnt "
+            "FROM giveaways g WHERE creator_id=$1 ORDER BY id DESC LIMIT 15", message.from_user.id)
     if not rows:
-        await message.answer(f"❌ В розыгрыше `#{giveaway_id}` больше нет других участников для реролла!")
+        await message.answer("У вас пока нет конкурсов.")
         return
+    lines = []
+    for r in rows:
+        kind = "⚡️" if r["kind"] == "fast" else "📊"
+        st = "🟢" if r["status"] == "active" else "🔴"
+        extra = f" · {r['cnt']} уч." if r["kind"] == "normal" else ""
+        lines.append(f"{kind}{st} <b>#{r['id']}</b> — {esc(r['prize'])}{extra}")
+    await message.answer("\n".join(lines))
 
-    new_winner = random.choice(rows)
-    winner_username = f"@{new_winner['username']}" if new_winner['username'] != "Без username" else f"ID: {new_winner['user_id']}"
 
-    await message.answer(
-        f"🔄 **ПЕРЕРОЛЛ РОЗЫГРЫША #{giveaway_id}** 🔄\n\n"
-        f"🏆 **Новый победитель:** {winner_username} (Номер билета: **#{new_winner['ticket_number']}**)\n"
-        f"👥 Осталось участников в пуле: {len(rows)}\n\n"
-        f"💬 *Опубликуйте этот результат в канале!*",
-        parse_mode="Markdown"
-    )
-
-# --- Конструктор розыгрышей ---
+# ============================== Создание конкурса ==============================
 @dp.message(Command("new_giveaway"))
 async def cmd_new_giveaway(message: types.Message, state: FSMContext):
-    pool = dp["pool"]
-    if not await is_creator(pool, message.from_user.id):
-        await message.answer("❌ У вас нет доступа к созданию розыгрышей!")
+    if not await is_creator(dp["pool"], message.from_user.id):
+        await message.answer("❌ У вас нет доступа!")
         return
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📊 Обычный конкурс", callback_data="mode_normal")
-    builder.button(text="⚡️ Фаст-Клик (Кто первый)", callback_data="mode_fast")
-    builder.adjust(1)
-
-    await message.answer("🛠 **Создание нового розыгрыша**\n\nВыберите формат проведения:", reply_markup=builder.as_markup())
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Обычный конкурс", callback_data="mode_normal")
+    kb.button(text="⚡️ Фаст-Клик", callback_data="mode_fast")
+    kb.adjust(1)
+    await message.answer("Выберите формат:", reply_markup=kb.as_markup())
     await state.set_state(GiveawayForm.mode)
+
 
 @dp.callback_query(GiveawayForm.mode, F.data.in_(["mode_normal", "mode_fast"]))
 async def process_mode(callback: types.CallbackQuery, state: FSMContext):
-    mode = "fast" if callback.data == "mode_fast" else "normal"
-    await state.update_data(mode=mode)
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🖼 NFT", callback_data="type_nft")
-    builder.button(text="🎁 Обычный приз (Stars)", callback_data="type_regular")
-    builder.adjust(1)
-
-    await callback.message.answer("Выберите тип приза:", reply_markup=builder.as_markup())
+    await state.update_data(mode="fast" if callback.data == "mode_fast" else "normal")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🖼 NFT", callback_data="type_nft")
+    kb.button(text="🎁 Stars", callback_data="type_regular")
+    kb.adjust(1)
+    await callback.message.answer("Выберите тип приза:", reply_markup=kb.as_markup())
     await state.set_state(GiveawayForm.prize_type)
     await callback.answer()
 
+
 @dp.callback_query(GiveawayForm.prize_type, F.data.in_(["type_nft", "type_regular"]))
 async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
-    prize_type = "NFT" if callback.data == "type_nft" else "Обычный"
-    await state.update_data(prize_type=prize_type)
-
-    if prize_type == "NFT":
-        await callback.message.answer("🔗 Отправьте ссылку на ваш **NFT** (текстом):")
-    else:
-        await callback.message.answer("🔢 Введите количество звёзд **только цифрами** (например: `500` или `1000`):")
-
+    is_nft = callback.data == "type_nft"
+    await state.update_data(prize_type="NFT" if is_nft else "Stars")
+    await callback.message.answer("Отправьте ссылку на NFT:" if is_nft else "Введите количество звёзд цифрами:")
     await state.set_state(GiveawayForm.prize_details)
     await callback.answer()
 
+
 @dp.message(GiveawayForm.prize_details)
 async def process_prize_details(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    prize_type = user_data.get("prize_type")
-    text_input = message.text.strip() if message.text else ""
-
-    if prize_type == "Обычный":
-        if not text_input.isdigit():
-            await message.answer("⚠️ Ошибка! Нужно ввести **только цифры** (например: `500`). Попробуй еще раз:")
+    data = await state.get_data()
+    txt = (message.text or "").strip()
+    if data["prize_type"] == "Stars":
+        if not txt.isdigit() or int(txt) <= 0:
+            await message.answer("⚠️ Введите только цифры:")
             return
-        prize_details = f"{text_input} Stars"
+        prize = f"{txt} Stars"
     else:
-        if not text_input:
-            await message.answer("⚠️ Ссылка не должна быть пустой. Отправьте ссылку на NFT:")
+        if not txt:
+            await message.answer("⚠️ Ссылка не должна быть пустой:")
             return
-        prize_details = text_input
+        prize = f"NFT ({txt})"
 
-    await state.update_data(prize_details=prize_details)
-
-    if user_data.get("mode") == "fast":
-        pool = dp["pool"]
-        giveaway_id = random.randint(1000, 9999)
-        bot_info = await bot.get_me()
-        bot_username = bot_info.username
-
-        await create_fast_click(pool, giveaway_id, message.from_user.id, f"{prize_type}: {prize_details}")
-        fast_link = f"https://tg.catup.lol/{bot_username}?start=fast_{giveaway_id}"
-
-        text = (
-            f"⚡️ **ФАСТ-КЛИК РОЗЫГРЫШ!** ⚡️\n\n"
-            f"🎁 **Приз:** {prize_details}\n\n"
-            f"🚀 Кто первый нажмёт на ссылку ниже, тот и забирает приз!\n\n"
-            f"👉 [⚡️ Забрать приз!]({fast_link})\n\n"
-            f"⏱ *Победитель определяется мгновенно.*"
-        )
-
-        await message.answer(f"⚡️ **Ваш Фаст-Клик конкурс готов! (ID: `{giveaway_id}`) Скопируйте текст в свой канал:**", parse_mode="Markdown")
-        await message.answer(text, parse_mode="Markdown")
+    if data["mode"] == "fast":
+        async with dp["pool"].acquire() as conn:
+            gid = await conn.fetchval(
+                "INSERT INTO giveaways (creator_id, kind, prize) VALUES ($1,'fast',$2) RETURNING id",
+                message.from_user.id, prize)
+        me = await bot.get_me()
+        link = f"{LINK_BASE}/{me.username}?start=fast_{gid}"
+        await message.answer("Готово! Перешлите это сообщение в канал 👇")
+        await message.answer(f"⚡️ <b>Фаст-клик розыгрыш #{gid}!</b>\nПриз: {esc(prize)}\n\n"
+                             f'👉 <a href="{esc(link)}">Забрать приз</a>')
         await state.clear()
     else:
-        await message.answer(
-            "📢 **Введите юзернейм вашего канала**\n"
-            "(например: `@PavelBet`)\n\n"
-            "ℹ️ *Бот проверит существование канала перед созданием.*"
-        )
+        await state.update_data(prize=prize)
+        await message.answer("Введите юзернейм канала (например, <code>@PavelBet</code>).\n"
+                             "⚠️ Бот должен быть <b>администратором</b> этого канала — иначе проверка подписки не работает.")
         await state.set_state(GiveawayForm.channel_username)
 
-# Строгая проверка канала: отсекаем мусор и проверяем через API
+
 @dp.message(GiveawayForm.channel_username)
 async def process_channel(message: types.Message, state: FSMContext):
-    channel_input = message.text.strip()
-    
-    if not channel_input.startswith("@") or len(channel_input) < 4:
-        await message.answer(
-            "⚠️ **Неверный формат!**\n"
-            "Юзернейм канала должен начинаться с символа `@` и содержать хотя бы пару символов (например, `@PavelBet`). Попробуйте еще раз:"
-        )
+    ch = (message.text or "").strip()
+    if not re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,31}", ch):
+        await message.answer("⚠️ Неверный формат! Пример: <code>@PavelBet</code>")
         return
-
     try:
-        chat = await bot.get_chat(chat_id=channel_input)
-        if chat.type != "channel":
-            await message.answer("❌ Это не канал! Укажите именно юзернейм **канала**:")
-            return
-    except Exception:
-        await message.answer(
-            "❌ **Канал не найден!**\n"
-            "Такого канала не существует или бот не имеет к нему доступа. Проверьте юзернейм и попробуйте снова:"
-        )
+        chat = await bot.get_chat(chat_id=ch)
+    except TelegramAPIError:
+        await message.answer("❌ Канал не найден. Проверьте юзернейм:")
+        return
+    if chat.type != "channel":
+        await message.answer("❌ Это не канал! Укажите юзернейм канала:")
+        return
+    try:
+        me = await bot.get_me()
+        bm = await bot.get_chat_member(chat_id=chat.id, user_id=me.id)
+        if bm.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            raise ValueError
+    except (TelegramAPIError, ValueError):
+        await message.answer("❌ Бот не админ в этом канале. Добавьте его администратором и отправьте юзернейм снова:")
         return
 
-    await state.update_data(channel_username=channel_input)
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⏭ Пропустить (без условий)", callback_data="skip_conditions")
-    builder.adjust(1)
-
-    await message.answer(
-        "📌 **Укажите условия для участия**\n"
-        "(например: `Поставить реакцию на пост`)\n\n"
-        "*Подписка на канал проверится автоматически!* Можете указать доп. условия или нажать кнопку ниже:",
-        reply_markup=builder.as_markup()
-    )
+    await state.update_data(channel_id=chat.id, channel_username=ch)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить (только подписка)", callback_data="skip_conditions")
+    await message.answer("Укажите дополнительные условия (или нажмите кнопку):", reply_markup=kb.as_markup())
     await state.set_state(GiveawayForm.conditions)
+
 
 @dp.callback_query(GiveawayForm.conditions, F.data == "skip_conditions")
 async def skip_conditions_callback(callback: types.CallbackQuery, state: FSMContext):
-    await finish_creating_giveaway(callback.message, state, conditions="Подписка на канал")
     await callback.answer()
+    await finish_creating_giveaway(callback.message, callback.from_user.id, state, "")
+
 
 @dp.message(GiveawayForm.conditions)
 async def process_conditions(message: types.Message, state: FSMContext):
-    conditions = message.text.strip() if message.text else "Подписка на канал"
-    await finish_creating_giveaway(message, state, conditions=conditions)
+    await finish_creating_giveaway(message, message.from_user.id, state, (message.text or "").strip())
 
-async def finish_creating_giveaway(message: types.Message, state: FSMContext, conditions: str):
-    pool = dp["pool"]
-    user_data = await state.get_data()
-    prize_type = user_data.get("prize_type")
-    prize_details = user_data.get("prize_details")
-    channel_username = user_data.get("channel_username")
 
-    giveaway_id = random.randint(100, 999)
-    bot_info = await bot.get_me()
-    bot_username = bot_info.username
-
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO giveaway_channels (giveaway_id, channel_id) VALUES ($1, $2);",
-            giveaway_id, channel_username
-        )
-
-    join_link = f"https://tg.catup.lol/{bot_username}?start=join_{giveaway_id}"
-
-    if prize_type == "NFT":
-        prize_text = f"🖼 **Приз:** NFT ({prize_details})"
-    else:
-        prize_text = f"🎁 **Приз:** {prize_details}"
-
-    text = (
-        f"🎉 **РОЗЫГРЫШ #{giveaway_id}** 🎉\n\n"
-        f"{prize_text}\n"
-        f"📌 **Условия участия:** {conditions} (Подписка на {channel_username} проверяется автоматически!)\n\n"
-        f"🏆 **Победителей:** 1\n"
-        f"⏰ **Окончание:** По решению организатора\n\n"
-        f"👉 [🎉 Участвовать в розыгрыше]({join_link})"
-    )
-
-    await message.answer(
-        f"✅ **Ваш пост с конкурсом готов! (ID: `{giveaway_id}`)**\n"
-        f"Завершить: `/finish {giveaway_id}` | Переролл: `/reroll {giveaway_id}`\n\n"
-        f"Скопируйте текст ниже и вставьте в свой канал:",
-        parse_mode="Markdown"
-    )
-    await message.answer(text, parse_mode="Markdown")
+async def finish_creating_giveaway(message: types.Message, creator_id: int, state: FSMContext, extra: str):
+    data = await state.get_data()
+    conditions = f"Подписка на {data['channel_username']}" + (f"\n{extra}" if extra else "")
+    async with dp["pool"].acquire() as conn:
+        gid = await conn.fetchval(
+            "INSERT INTO giveaways (creator_id, kind, prize, conditions, channel_id, channel_username) "
+            "VALUES ($1,'normal',$2,$3,$4,$5) RETURNING id",
+            creator_id, data["prize"], conditions, data["channel_id"], data["channel_username"])
+    me = await bot.get_me()
+    link = f"{LINK_BASE}/{me.username}?start=join_{gid}"
+    await message.answer("Готово! Перешлите это сообщение в канал 👇")
+    await message.answer(f"🎉 <b>РОЗЫГРЫШ #{gid}</b> 🎉\n\n🎁 Приз: {esc(data['prize'])}\n"
+                         f"📌 Условия: {esc(conditions)}\n\n"
+                         f'👉 <a href="{esc(link)}">🎉 Участвовать</a>')
+    await message.answer(f"Итоги: <code>/finish {gid}</code>")
     await state.clear()
 
+
+# ============================== Запуск ==============================
 async def main():
     pool = await get_db_pool()
     await init_db(pool)
     dp["pool"] = pool
-    
     await start_dummy_server()
-    
     await set_main_menu(bot)
-    print("🤖 Бот запущен!")
-    await dp.start_polling(bot)
+    log.info("Бот запущен!")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        await pool.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
