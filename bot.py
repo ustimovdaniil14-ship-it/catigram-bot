@@ -542,9 +542,12 @@ async def process_prize_details(message: types.Message, state: FSMContext):
             return
         prize = f"{txt} Stars"
     else:
-        if not txt:
-            await message.answer("⚠️ Ссылка не должна быть пустой:")
+        if not re.fullmatch(r"(https?://)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/\S*)?", txt):
+            await message.answer("⚠️ Это не ссылка. Отправьте ссылку на NFT, например:\n"
+                                 "<code>https://t.me/nft/PlushPepe-1</code>")
             return
+        if not txt.startswith("http"):
+            txt = "https://" + txt
         prize = f"NFT ({txt})"
 
     if data["mode"] == "fast":
@@ -573,8 +576,11 @@ async def process_channel(message: types.Message, state: FSMContext):
         return
     try:
         chat = await bot.get_chat(chat_id=ch)
-    except TelegramAPIError:
-        await message.answer("❌ Канал не найден. Проверьте юзернейм:")
+    except TelegramAPIError as e:
+        log.warning("get_chat(%s) failed: %s", ch, e)
+        await message.answer(f"❌ Канал не найден или бот его не видит.\n"
+                             f"Добавьте бота админом в канал и отправьте юзернейм снова.\n\n"
+                             f"Ошибка: <code>{esc(str(e))}</code>")
         return
     if chat.type != "channel":
         await message.answer("❌ Это не канал! Укажите юзернейм канала:")
