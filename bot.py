@@ -52,7 +52,6 @@ async def init_db(pool):
                 user_id BIGINT PRIMARY KEY
             );
         """)
-        # Теперь храним порядковый номер (ticket_number)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS participants (
                 giveaway_id INT,
@@ -95,15 +94,13 @@ async def add_creator(pool, user_id):
 
 async def add_participant_with_ticket(pool, giveaway_id, user_id, username):
     async with pool.acquire() as conn:
-        # Проверяем, не участвует ли уже
         existing = await conn.fetchrow(
             "SELECT ticket_number FROM participants WHERE giveaway_id = $1 AND user_id = $2",
             giveaway_id, user_id
         )
         if existing:
-            return existing["ticket_number"], False  # Уже в базе, возвращаем его номер
+            return existing["ticket_number"], False
 
-        # Узнаем последний номер и прибавляем 1
         max_ticket = await conn.fetchval(
             "SELECT MAX(ticket_number) FROM participants WHERE giveaway_id = $1",
             giveaway_id
@@ -491,13 +488,32 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         await message.answer(
             "📢 **Введите юзернейм вашего канала**\n"
             "(например: `@PavelBet`)\n\n"
-            "ℹ️ *Бот должен быть администратором в этом канале для проверки подписок.*"
+            "ℹ️ *Бот проверит существование канала перед созданием.*"
         )
         await state.set_state(GiveawayForm.channel_username)
 
+# Жёсткая проверка канала: проверяем реально ли он существует в Telegram
 @dp.message(GiveawayForm.channel_username)
 async def process_channel(message: types.Message, state: FSMContext):
     channel_input = message.text.strip()
+    
+    if not channel_input.startswith("@"):
+        await message.answer("⚠️ Юзернейм канала должен начинаться с символа `@` (например, `@PavelBet`). Попробуйте еще раз:")
+        return
+
+    try:
+        # Пытаемся получить информацию о чате/канале через API
+        chat = await bot.get_chat(chat_id=channel_input)
+        if chat.type != "channel":
+            await message.answer("❌ Это не канал! Укажите именно юзернейм **канала**:")
+            return
+    except Exception:
+        await message.answer(
+            "❌ **Канал не найден!**\n"
+            "Такого канала не существует или юзернейм введен с ошибкой. Проверьте правильность и попробуйте снова:"
+        )
+        return
+
     await state.update_data(channel_username=channel_input)
 
     builder = InlineKeyboardBuilder()
@@ -549,7 +565,7 @@ async def finish_creating_giveaway(message: types.Message, state: FSMContext, co
     text = (
         f"🎉 **РОЗЫГРЫШ #{giveaway_id}** 🎉\n\n"
         f"{prize_text}\n"
-        f"📌 **Условия участия:** {conditions} (Проверяется автоматически!)\n\n"
+        f"📌 **Условия участия:** {conditions} (Подписка на {channel_username} проверяется автоматически!)\n\n"
         f"🏆 **Победителей:** 1\n"
         f"⏰ **Окончание:** По решению организатора\n\n"
         f"👉 [🎉 Участвовать в розыгрыше]({join_link})"
@@ -558,7 +574,7 @@ async def finish_creating_giveaway(message: types.Message, state: FSMContext, co
     await message.answer(
         f"✅ **Ваш пост с конкурсом готов! (ID: `{giveaway_id}`)**\n"
         f"Завершить: `/finish {giveaway_id}` | Переролл: `/reroll {giveaway_id}`\n\n"
-        f"Скопируйте текст ниже и вставьте в свой канал (кнопка исчезать не будет):",
+        f"Скопируйте текст ниже и вставьте в свой канал:",
         parse_mode="Markdown"
     )
     await message.answer(text, parse_mode="Markdown")
