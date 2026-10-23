@@ -13,10 +13,10 @@ from aiogram.types import BotCommand
 
 # ================= Настройки =================
 BOT_TOKEN = "1780243771:Gb_eq0_l0bqdqxSG5aU1zTnkyVSUjHnETPp"
-ADMIN_ID = 1780243771
+ADMIN_ID = 1780243247  # Твой актуальный Telegram ID главного администратора
 ADMIN_USERNAME = "@Pavelmanager"
 
-PRICE_STARS = 600  # Цена доступа к созданию
+PRICE_STARS = 600  # Цена доступа
 
 # Подключение к Neon PostgreSQL
 DATABASE_URL = "postgresql://neondb_owner:npg_pWVDXMBAHT90@ep-jolly-heart-b5c4ag91-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
@@ -64,6 +64,7 @@ async def init_db(pool):
                 prize_details TEXT
             );
         """)
+        # Автоматически добавляем твой ID в создатели при запуске
         await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", ADMIN_ID)
 
 async def is_creator(pool, user_id):
@@ -75,7 +76,12 @@ async def is_creator(pool, user_id):
 
 async def add_creator(pool, user_id):
     async with pool.acquire() as conn:
+        # Проверяем, был ли уже доступ
+        row = await conn.fetchrow("SELECT user_id FROM creators WHERE user_id = $1", user_id)
+        exists = row is not None
+        
         await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", user_id)
+        return exists
 
 async def add_participant(pool, giveaway_id, user_id, username):
     async with pool.acquire() as conn:
@@ -134,7 +140,7 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     user_id = message.from_user.id
     args = command.args
 
-    # Переход по кнопке Фаст-Клика
+    # Обработка клика в Фаст-Клике
     if args and args.startswith("fast_"):
         giveaway_id = int(args.split("_")[1])
         status, prize, creator_id = await claim_fast_click(pool, giveaway_id, user_id, message.from_user.username)
@@ -165,18 +171,18 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             await message.answer("⚠️ Розыгрыш не найден или завершён.")
         return
 
-    # Переход по кнопке участия в обычном конкурсе
+    # Обработка участия в обычном конкурсе (кнопка остается активной у всех)
     if args and args.startswith("join_"):
         giveaway_id = int(args.split("_")[1])
         success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
         
         if success:
             await message.answer(
-                "🎉 **Ты участвуешь в розыгрыше!**\n"
-                "Твой номер участника сохранён ботом."
+                "🎉 **Ты успешно участвуешь в розыгрыше!**\n"
+                "Твой номер участника зафиксирован ботом."
             )
         else:
-            await message.answer("⚠️ Вы уже зарегистрированы в этом розыгрыше!")
+            await message.answer("ℹ️ Вы уже зарегистрированы в этом розыгрыше!")
         return
 
     if await is_creator(pool, user_id):
@@ -233,12 +239,18 @@ async def cmd_give_access(message: types.Message):
     args = message.text.split()
     if len(args) > 1 and args[1].isdigit():
         target_id = int(args[1])
-        await add_creator(pool, target_id)
-        await message.answer(f"✅ Доступ успешно выдан пользователю `{target_id}`!")
-        try:
-            await bot.send_message(target_id, "🎉 Администратор выдал вам доступ к созданию розыгрышей!")
-        except Exception:
-            pass
+        already_had = await add_creator(pool, target_id)
+        
+        if already_had:
+            await message.answer(f"ℹ️ У пользователя `{target_id}` **уже был** бесплатный доступ ранее.")
+        else:
+            await message.answer(f"✅ Бесплатный доступ **успешно выдан** пользователю `{target_id}`!")
+            try:
+                await bot.send_message(target_id, "🎉 Администратор выдал вам бесплатный доступ к созданию розыгрышей!")
+            except Exception:
+                pass
+    else:
+        await message.answer("⚠️ Укажите ID. Пример: `/give_access 123456789`", parse_mode="Markdown")
 
 @dp.message(Command("finish"))
 async def cmd_finish(message: types.Message):
@@ -306,9 +318,9 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(prize_type=prize_type)
 
     if prize_type == "NFT":
-        await callback.message.answer("🔗 Отправьте ссылку на ваш **NFT**:")
+        await callback.message.answer("🔗 Отправьте ссылку на ваш **NFT** (текстом):")
     else:
-        await callback.message.answer("✏️ Напишите название приза (например: `500 Stars`):")
+        await callback.message.answer("🔢 Введите количество звёзд **только цифрами** (например: `500` или `1000`):")
 
     await state.set_state(GiveawayForm.prize_details)
     await callback.answer()
@@ -316,14 +328,24 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(GiveawayForm.prize_details)
 async def process_prize_details(message: types.Message, state: FSMContext):
     pool = dp["pool"]
-    prize_val = message.text.strip() if message.text else "500 Stars"
-    await state.update_data(prize_details=prize_val)
     user_data = await state.get_data()
+    prize_type = user_data["prize_type"]
+    text_input = message.text.strip() if message.text else ""
+
+    if prize_type == "Обычный":
+        if not text_input.isdigit():
+            await message.answer("⚠️ Ошибка! Нужно ввести **только цифры** (например: `500`). Попробуй еще раз:")
+            return
+        prize_details = f"{text_input} Stars"
+    else:
+        if not text_input:
+            await message.answer("⚠️ Ссылка не должна быть пустой. Отправьте ссылку на NFT:")
+            return
+        prize_details = text_input
+
+    await state.update_data(prize_details=prize_details)
 
     if user_data["mode"] == "fast":
-        prize_type = user_data["prize_type"]
-        prize_details = user_data["prize_details"]
-        
         giveaway_id = random.randint(1000, 9999)
         bot_info = await bot.get_me()
         bot_username = bot_info.username
