@@ -29,12 +29,12 @@ session = AiohttpSession(api=catigram_server)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- Состояния конструктора розыгрышей ---
+# --- Состояния конструктора ---
 class GiveawayForm(StatesGroup):
-    mode = State()          # Обычный или Fast Click
-    prize_type = State()    # NFT или Обычный
-    prize_details = State() # Детали приза
-    conditions = State()    # Условия
+    mode = State()          
+    prize_type = State()    
+    prize_details = State() 
+    conditions = State()    
 
 # --- База данных (PostgreSQL / Neon) ---
 async def get_db_pool():
@@ -111,7 +111,7 @@ async def claim_fast_click(pool, giveaway_id, user_id, username):
         )
         return "win", prize_details, creator_id
 
-# --- Кнопка "Меню" ---
+# --- Главное меню ---
 async def set_main_menu(bot: Bot):
     commands = [
         BotCommand(command="start", description="Главное меню / Перезапуск"),
@@ -134,22 +134,17 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     user_id = message.from_user.id
     args = command.args
 
-    # Обработка Фаст-клика
     if args and args.startswith("fast_"):
         giveaway_id = int(args.split("_")[1])
         status, prize, creator_id = await claim_fast_click(pool, giveaway_id, user_id, message.from_user.username)
         
         if status == "win":
             user_tg = f"@{message.from_user.username}" if message.from_user.username else "Без username"
-            
-            # Уведомление участнику
             await message.answer(
                 f"⚡️ **ПОЗДРАВЛЯЕМ! ТЫ БЫЛ ПЕРВЫМ!** ⚡️\n\n"
                 f"🎉 Ты успешно забрал приз: **{prize}**!\n"
                 f"Организатор скоро свяжется с тобой."
             )
-            
-            # Отправка юзернейма создателю конкурса!
             try:
                 await bot.send_message(
                     chat_id=creator_id,
@@ -169,7 +164,6 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             await message.answer("⚠️ Розыгрыш не найден или завершён.")
         return
 
-    # Обработка обычного конкурса
     if args and args.startswith("join_"):
         giveaway_id = int(args.split("_")[1])
         success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
@@ -205,7 +199,6 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             reply_markup=builder.as_markup()
         )
 
-# Покупка доступа
 @dp.callback_query(F.data == "buy_access")
 async def buy_access_callback(callback: types.CallbackQuery):
     prices = [types.LabeledPrice(label="Доступ к созданию розыгрышей", amount=PRICE_STARS)]
@@ -230,7 +223,6 @@ async def payment_success(message: types.Message):
     await add_creator(pool, message.from_user.id)
     await message.answer("🎉 **Оплата прошла успешно!** Теперь тебе доступно создание розыгрышей.")
 
-# Ручная выдача доступа
 @dp.message(Command("give_access"))
 async def cmd_give_access(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -246,7 +238,6 @@ async def cmd_give_access(message: types.Message):
         except Exception:
             pass
 
-# --- Команда выбора победителя /finish <ID> ---
 @dp.message(Command("finish"))
 async def cmd_finish(message: types.Message):
     pool = dp["pool"]
@@ -277,7 +268,7 @@ async def cmd_finish(message: types.Message):
         parse_mode="Markdown"
     )
 
-# --- Конструктор розыгрышей ---
+# --- Конструктор розыгрышей (По кнопкам) ---
 @dp.message(Command("new_giveaway"))
 async def cmd_new_giveaway(message: types.Message, state: FSMContext):
     pool = dp["pool"]
@@ -315,7 +306,7 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
     if prize_type == "NFT":
         await callback.message.answer("🔗 Отправьте ссылку на ваш **NFT**:")
     else:
-        await callback.message.answer("✏️ Напишите наименование приза (например: `500 Stars`):")
+        await callback.message.answer("✏️ Напишите название или количество приза (например: `500 Stars`):")
 
     await state.set_state(GiveawayForm.prize_details)
     await callback.answer()
@@ -323,7 +314,8 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(GiveawayForm.prize_details)
 async def process_prize_details(message: types.Message, state: FSMContext):
     pool = dp["pool"]
-    await state.update_data(prize_details=message.text.strip())
+    prize_val = message.text.strip() if message.text else "500 Stars"
+    await state.update_data(prize_details=prize_val)
     user_data = await state.get_data()
 
     if user_data["mode"] == "fast":
@@ -359,7 +351,7 @@ async def process_conditions(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
     prize_type = user_data["prize_type"]
     prize_details = user_data["prize_details"]
-    conditions = message.text.strip()
+    conditions = message.text.strip() if message.text else "Подписка на канал"
 
     giveaway_id = random.randint(100, 999)
     bot_info = await bot.get_me()
@@ -392,7 +384,6 @@ async def process_conditions(message: types.Message, state: FSMContext):
     await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
     await state.clear()
 
-# --- Запуск ---
 async def main():
     pool = await get_db_pool()
     await init_db(pool)
