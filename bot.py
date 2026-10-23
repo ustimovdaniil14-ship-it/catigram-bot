@@ -224,6 +224,34 @@ async def set_main_menu(bot: Bot):
 
 
 # ============================== Старт / участие ==============================
+@dp.message(Command("probe"))
+async def cmd_probe(message: types.Message, command: CommandObject):
+    """Админ-диагностика: какие форматы chat_id принимает сервер. Пример: /probe PavelBet"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    name = (command.args or "").strip().lstrip("@")
+    if not name:
+        await message.answer("Использование: <code>/probe PavelBet</code>")
+        return
+    variants = [name, f"@{name}", f"t.me/{name}", f"https://t.me/{name}",
+                f"{LINK_BASE}/{name}", f"https://tg.catup.lol/{name}"]
+    me = await bot.get_me()
+    lines = []
+    for v in variants:
+        try:
+            chat = await bot.get_chat(chat_id=v)
+            lines.append(f"✅ getChat <code>{esc(v)}</code> → id <code>{chat.id}</code>")
+            continue
+        except TelegramAPIError as e:
+            r1 = str(e)
+        try:
+            await bot.get_chat_member(chat_id=v, user_id=me.id)
+            lines.append(f"✅ getChatMember <code>{esc(v)}</code> работает")
+        except TelegramAPIError as e:
+            lines.append(f"❌ <code>{esc(v)}</code>: {esc(r1)} / {esc(str(e))}")
+    await message.answer("\n".join(lines))
+
+
 @dp.message(Command("myid"))
 async def cmd_myid(message: types.Message):
     await message.answer(f"🆔 Твой Telegram ID: <code>{message.from_user.id}</code>")
