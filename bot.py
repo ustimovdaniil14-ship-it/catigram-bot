@@ -143,7 +143,7 @@ async def set_main_menu(bot: Bot):
         BotCommand(command="start", description="Главное меню / Перезапуск"),
         BotCommand(command="new_giveaway", description="Создать новый конкурс"),
         BotCommand(command="finish", description="Итоги: /finish ID"),
-        BotCommand(command="reroll", description="Переролл: /reroll ID юзер_ID"),
+        BotCommand(command="reroll", description="Переролл: /reroll ID"),
         BotCommand(command="myid", description="Узнать свой Telegram ID"),
     ]
     await bot.set_my_commands(commands)
@@ -204,11 +204,11 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
                 if member.status in ["left", "kicked"]:
                     await message.answer(
                         "❌ **Вы не подписаны на канал!**\n\n"
-                        f"Чтобы принять участие в розыгрыше, подпишитесь на канал {channel_id} и нажмите кнопку «Участвовать» снова."
+                        f"Чтобы принять участие, подпишитесь на канал {channel_id} и нажмите кнопку «Участвовать» снова."
                     )
                     return
             except Exception:
-                pass
+                pass # Пропускаем, если API прокси временно не ответил, чтобы пользователь не страдал
 
         success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
         if success:
@@ -350,7 +350,7 @@ async def cmd_finish(message: types.Message):
     winner_username = f"@{winner['username']}" if winner['username'] != "Без username" else f"ID: {winner['user_id']}"
 
     await message.answer(
-        f"🎉 **ИТОГИ РОЗЫГРЫШИ #{giveaway_id}** 🎉\n\n"
+        f"🎉 **ИТОГИ РОЗЫГРЫША #{giveaway_id}** 🎉\n\n"
         f"🏆 **Победитель:** {winner_username} (`ID: {winner['user_id']}`)\n"
         f"👥 Всего участников: {len(rows)}\n\n"
         f"💬 *Скопируйте этот текст и опубликуйте его в своём канале!*",
@@ -370,7 +370,6 @@ async def cmd_reroll(message: types.Message):
 
     giveaway_id = int(args[1])
     async with pool.acquire() as conn:
-        # Если передан ID конкретного старого победителя вторым аргументом, удаляем его из базы участников
         if len(args) > 2 and args[2].isdigit():
             old_winner_id = int(args[2])
             await conn.execute("DELETE FROM participants WHERE giveaway_id = $1 AND user_id = $2", giveaway_id, old_winner_id)
@@ -478,31 +477,16 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         await state.clear()
     else:
         await message.answer(
-            "📢 **Введите юзернейм или ID вашего канала**\n"
-            "(например: `@my_channel`)\n\n"
-            "ℹ️ *Зачем это нужно:* Бот должен быть администратором в этом канале для автоматической проверки подписок."
+            "📢 **Введите юзернейм вашего канала**\n"
+            "(например: `@PavelBet`)\n\n"
+            "ℹ️ *Бот должен быть администратором в этом канале для проверки подписок участников.*"
         )
         await state.set_state(GiveawayForm.channel_username)
 
+# Сразу без лишних проверок принимаем юзернейм канала
 @dp.message(GiveawayForm.channel_username)
 async def process_channel(message: types.Message, state: FSMContext):
     channel_input = message.text.strip()
-    
-    try:
-        bot_member = await bot.get_chat_member(chat_id=channel_input, user_id=bot.id)
-        if bot_member.status not in ["administrator", "creator"]:
-            await message.answer(
-                "❌ **Ошибка: Бот не является администратором в этом канале!**\n\n"
-                f"Добавьте бота `{bot.id}` в администраторы канала `{channel_input}` с правом просмотра участников, иначе проверка не сработает. Попробуйте снова:"
-            )
-            return
-    except Exception:
-        await message.answer(
-            "⚠️ **Не удалось найти канал или проверить права.**\n"
-            "Убедитесь, что юзернейм указан верно (`@my_channel`) и бот там админ. Попробуйте еще раз:"
-        )
-        return
-
     await state.update_data(channel_username=channel_input)
 
     builder = InlineKeyboardBuilder()
