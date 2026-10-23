@@ -569,35 +569,31 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         await state.set_state(GiveawayForm.channel_username)
 
 
+def extract_forward_chat(message: types.Message):
+    """Достаёт чат-источник пересылки в любом формате (новом или старом)."""
+    d = message.model_dump(exclude_none=True)
+    fo = d.get("forward_origin")
+    if isinstance(fo, dict) and isinstance(fo.get("chat"), dict):
+        return fo["chat"], d
+    if isinstance(d.get("forward_from_chat"), dict):
+        return d["forward_from_chat"], d
+    return None, d
+
+
 @dp.message(GiveawayForm.channel_username)
 async def process_channel(message: types.Message, state: FSMContext):
-    origin = getattr(message, "forward_origin", None)
-    fchat = getattr(origin, "chat", None) if origin else None
+    fchat, raw = extract_forward_chat(message)
     if fchat is None:
-        fchat = getattr(message, "forward_from_chat", None)
-
-    chat_id = username = title = None
-    if fchat is not None:
-        if fchat.type != "channel":
-            await message.answer("❌ Это не канал. Перешлите пост из канала:")
-            return
-        chat_id, username, title = fchat.id, fchat.username, fchat.title
-    else:
-        txt = (message.text or "").strip()
-        if re.fullmatch(r"-100\d{5,}", txt):
-            chat_id = int(txt)
-        elif re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,31}", txt):
-            try:
-                chat = await bot.get_chat(chat_id=txt)
-                chat_id, username, title = chat.id, chat.username, chat.title
-            except TelegramAPIError as e:
-                await message.answer("❌ Сервер не находит канал по юзернейму.\n"
-                                     "Просто <b>перешлите сюда любой пост</b> из канала.\n\n"
-                                     f"Ошибка: <code>{esc(str(e))}</code>")
-                return
-        else:
-            await message.answer("⚠️ Перешлите сюда любой пост из канала (или отправьте ID вида <code>-100123...</code>):")
-            return
+        log.warning("Пересылка не распознана: %s", raw)
+        fwd = {k: v for k, v in raw.items() if "forward" in k}
+        await message.answer("⚠️ Не вижу, из какого канала пост. Перешлите <b>пост из канала</b> "
+                             "(не от пользователя).\n\n"
+                             f"Что пришло: <code>{esc(str(fwd) if fwd else 'нет данных о пересылке')}</code>")
+        return
+    if fchat.get("type") != "channel":
+        await message.answer("❌ Это не канал. Перешлите пост из канала:")
+        return
+    chat_id, username, title = fchat["id"], fchat.get("username"), fchat.get("title")
 
     try:
         me = await bot.get_me()
