@@ -35,12 +35,13 @@ class GiveawayForm(StatesGroup):
     mode = State()          
     prize_type = State()    
     prize_details = State() 
+    channel_username = State()
     conditions = State()    
 
 class DonateForm(StatesGroup):
     amount = State()
 
-# --- База данных (PostgreSQL / Neon) ---
+# --- База данных ---
 async def get_db_pool():
     return await asyncpg.create_pool(DATABASE_URL)
 
@@ -57,6 +58,12 @@ async def init_db(pool):
                 user_id BIGINT,
                 username TEXT,
                 PRIMARY KEY (giveaway_id, user_id)
+            );
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS giveaway_channels (
+                giveaway_id INT PRIMARY KEY,
+                channel_id TEXT
             );
         """)
         await conn.execute("""
@@ -135,7 +142,8 @@ async def set_main_menu(bot: Bot):
     commands = [
         BotCommand(command="start", description="Главное меню / Перезапуск"),
         BotCommand(command="new_giveaway", description="Создать новый конкурс"),
-        BotCommand(command="finish", description="Завершить конкурс: /finish ID"),
+        BotCommand(command="finish", description="Итоги: /finish ID"),
+        BotCommand(command="reroll", description="Переролл: /reroll ID юзер_ID"),
         BotCommand(command="myid", description="Узнать свой Telegram ID"),
     ]
     await bot.set_my_commands(commands)
@@ -185,8 +193,24 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
 
     if args and args.startswith("join_"):
         giveaway_id = int(args.split("_")[1])
-        success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
         
+        async with pool.acquire() as conn:
+            ch_row = await conn.fetchrow("SELECT channel_id FROM giveaway_channels WHERE giveaway_id = $1", giveaway_id)
+        
+        if ch_row:
+            channel_id = ch_row["channel_id"]
+            try:
+                member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+                if member.status in ["left", "kicked"]:
+                    await message.answer(
+                        "❌ **Вы не подписаны на канал!**\n\n"
+                        f"Чтобы принять участие в розыгрыше, подпишитесь на канал {channel_id} и нажмите кнопку «Участвовать» снова."
+                    )
+                    return
+            except Exception:
+                pass
+
+        success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
         if success:
             await message.answer(
                 "🎉 **Ты успешно участвуешь в розыгрыше!**\n"
@@ -203,10 +227,9 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
         await message.answer(
             "👋 **Привет, Создатель!**\n\n"
             "У тебя есть доступ к созданию розыгрышей.\n"
-            "Чтобы создать конкурс, используй команду:\n"
-            "👉 /new_giveaway\n\n"
-            "Чтобы подвести итоги конкурса:\n"
-            "👉 `/finish <ID_конкурса>`",
+            "👉 /new_giveaway — Создать конкурс\n"
+            "👉 `/finish <ID>` — Подвести итоги\n"
+            "👉 `/reroll <ID>` — Перевыбрать победителя",
             reply_markup=builder.as_markup()
         )
     else:
@@ -223,10 +246,10 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             reply_markup=builder.as_markup()
         )
 
-# --- Пожертвования (Донат) ---
+# --- Донаты ---
 @dp.callback_query(F.data == "donate_stars")
 async def start_donate(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("💖 **Пожертвование автору**\n\nВведите количество звёзд ⭐️, которое вы хотите пожертвовать (**только цифрами**, например: `50`, `100`, `500`):")
+    await callback.message.answer("💖 **Пожертвование автору**\n\nВведите количество звёзд ⭐️ (**только цифрами**, например: `50`, `100`):")
     await state.set_state(DonateForm.amount)
     await callback.answer()
 
@@ -234,7 +257,7 @@ async def start_donate(callback: types.CallbackQuery, state: FSMContext):
 async def process_donate_amount(message: types.Message, state: FSMContext):
     text_input = message.text.strip() if message.text else ""
     if not text_input.isdigit() or int(text_input) <= 0:
-        await message.answer("⚠️ Ошибка! Введите корректное число звёзд (только цифры, больше 0):")
+        await message.answer("⚠️ Ошибка! Введите корректное число звёзд:")
         return
 
     amount = int(text_input)
@@ -251,7 +274,6 @@ async def process_donate_amount(message: types.Message, state: FSMContext):
     )
     await state.clear()
 
-# --- Покупка доступа ---
 @dp.callback_query(F.data == "buy_access")
 async def buy_access_callback(callback: types.CallbackQuery):
     prices = [types.LabeledPrice(label="Доступ к созданию розыгрышей", amount=PRICE_STARS)]
@@ -274,14 +296,12 @@ async def pre_checkout_handler(pre_checkout_query: types.PreCheckoutQuery):
 async def payment_success(message: types.Message):
     pool = dp["pool"]
     payload = message.successful_payment.invoice_payload
-    
     if payload.startswith("donate_"):
-        await message.answer("💖 **Огромное спасибо за вашу поддержку!** Ваши звёзды очень помогают проекту развиваться!")
+        await message.answer("💖 **Огромное спасибо за вашу поддержку!**")
     else:
         await add_creator(pool, message.from_user.id)
         await message.answer("🎉 **Оплата прошла успешно!** Теперь тебе доступно создание розыгрышей.")
 
-# --- Выдача доступа админом ---
 @dp.message(Command("give_access"))
 async def cmd_give_access(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -330,10 +350,45 @@ async def cmd_finish(message: types.Message):
     winner_username = f"@{winner['username']}" if winner['username'] != "Без username" else f"ID: {winner['user_id']}"
 
     await message.answer(
-        f"🎉 **ИТОГИ РОЗЫГРЫША #{giveaway_id}** 🎉\n\n"
+        f"🎉 **ИТОГИ РОЗЫГРЫШИ #{giveaway_id}** 🎉\n\n"
         f"🏆 **Победитель:** {winner_username} (`ID: {winner['user_id']}`)\n"
         f"👥 Всего участников: {len(rows)}\n\n"
         f"💬 *Скопируйте этот текст и опубликуйте его в своём канале!*",
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("reroll"))
+async def cmd_reroll(message: types.Message):
+    pool = dp["pool"]
+    if not await is_creator(pool, message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) < 2 or not args[1].isdigit():
+        await message.answer("⚠️ Укажите ID розыгрыша для реролла. Пример: `/reroll 123`", parse_mode="Markdown")
+        return
+
+    giveaway_id = int(args[1])
+    async with pool.acquire() as conn:
+        # Если передан ID конкретного старого победителя вторым аргументом, удаляем его из базы участников
+        if len(args) > 2 and args[2].isdigit():
+            old_winner_id = int(args[2])
+            await conn.execute("DELETE FROM participants WHERE giveaway_id = $1 AND user_id = $2", giveaway_id, old_winner_id)
+
+        rows = await conn.fetch("SELECT user_id, username FROM participants WHERE giveaway_id = $1", giveaway_id)
+
+    if not rows:
+        await message.answer(f"❌ В розыгрыше `#{giveaway_id}` больше нет других участников для реролла!")
+        return
+
+    new_winner = random.choice(rows)
+    winner_username = f"@{new_winner['username']}" if new_winner['username'] != "Без username" else f"ID: {new_winner['user_id']}"
+
+    await message.answer(
+        f"🔄 **ПЕРЕРОЛЛ РОЗЫГРЫША #{giveaway_id}** 🔄\n\n"
+        f"🏆 **Новый победитель:** {winner_username} (`ID: {new_winner['user_id']}`)\n"
+        f"👥 Осталось участников в пуле: {len(rows)}\n\n"
+        f"💬 *Опубликуйте этот результат в канале!*",
         parse_mode="Markdown"
     )
 
@@ -382,7 +437,6 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(GiveawayForm.prize_details)
 async def process_prize_details(message: types.Message, state: FSMContext):
-    pool = dp["pool"]
     user_data = await state.get_data()
     prize_type = user_data.get("prize_type")
     text_input = message.text.strip() if message.text else ""
@@ -401,6 +455,7 @@ async def process_prize_details(message: types.Message, state: FSMContext):
     await state.update_data(prize_details=prize_details)
 
     if user_data.get("mode") == "fast":
+        pool = dp["pool"]
         giveaway_id = random.randint(1000, 9999)
         bot_info = await bot.get_me()
         bot_username = bot_info.username
@@ -422,19 +477,72 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
         await state.clear()
     else:
-        await message.answer("📌 **Укажите условия для участия**\n(например: `Подписка на канал`):")
-        await state.set_state(GiveawayForm.conditions)
+        await message.answer(
+            "📢 **Введите юзернейм или ID вашего канала**\n"
+            "(например: `@my_channel`)\n\n"
+            "ℹ️ *Зачем это нужно:* Бот должен быть администратором в этом канале для автоматической проверки подписок."
+        )
+        await state.set_state(GiveawayForm.channel_username)
+
+@dp.message(GiveawayForm.channel_username)
+async def process_channel(message: types.Message, state: FSMContext):
+    channel_input = message.text.strip()
+    
+    try:
+        bot_member = await bot.get_chat_member(chat_id=channel_input, user_id=bot.id)
+        if bot_member.status not in ["administrator", "creator"]:
+            await message.answer(
+                "❌ **Ошибка: Бот не является администратором в этом канале!**\n\n"
+                f"Добавьте бота `{bot.id}` в администраторы канала `{channel_input}` с правом просмотра участников, иначе проверка не сработает. Попробуйте снова:"
+            )
+            return
+    except Exception:
+        await message.answer(
+            "⚠️ **Не удалось найти канал или проверить права.**\n"
+            "Убедитесь, что юзернейм указан верно (`@my_channel`) и бот там админ. Попробуйте еще раз:"
+        )
+        return
+
+    await state.update_data(channel_username=channel_input)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⏭ Пропустить (без условий)", callback_data="skip_conditions")
+    builder.adjust(1)
+
+    await message.answer(
+        "📌 **Укажите условия для участия**\n"
+        "(например: `Поставить реакцию на пост`)\n\n"
+        "*Подписка на канал проверится автоматически!* Можете указать доп. условия или нажать кнопку ниже:",
+        reply_markup=builder.as_markup()
+    )
+    await state.set_state(GiveawayForm.conditions)
+
+@dp.callback_query(GiveawayForm.conditions, F.data == "skip_conditions")
+async def skip_conditions_callback(callback: types.CallbackQuery, state: FSMContext):
+    await finish_creating_giveaway(callback.message, state, conditions="Подписка на канал")
+    await callback.answer()
 
 @dp.message(GiveawayForm.conditions)
 async def process_conditions(message: types.Message, state: FSMContext):
+    conditions = message.text.strip() if message.text else "Подписка на канал"
+    await finish_creating_giveaway(message, state, conditions=conditions)
+
+async def finish_creating_giveaway(message: types.Message, state: FSMContext, conditions: str):
+    pool = dp["pool"]
     user_data = await state.get_data()
     prize_type = user_data.get("prize_type")
     prize_details = user_data.get("prize_details")
-    conditions = message.text.strip() if message.text else "Подписка на канал"
+    channel_username = user_data.get("channel_username")
 
     giveaway_id = random.randint(100, 999)
     bot_info = await bot.get_me()
     bot_username = bot_info.username
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO giveaway_channels (giveaway_id, channel_id) VALUES ($1, $2);",
+            giveaway_id, channel_username
+        )
 
     join_link = f"https://tg.catup.lol/{bot_username}?start=join_{giveaway_id}"
 
@@ -446,7 +554,7 @@ async def process_conditions(message: types.Message, state: FSMContext):
     text = (
         f"🎉 **РОЗЫГРЫШ #{giveaway_id}** 🎉\n\n"
         f"{prize_text}\n"
-        f"📌 **Условия участия:** {conditions}\n\n"
+        f"📌 **Условия участия:** {conditions} (Проверяется автоматически!)\n\n"
         f"🏆 **Победителей:** 1\n"
         f"⏰ **Окончание:** По решению организатора"
     )
@@ -456,7 +564,7 @@ async def process_conditions(message: types.Message, state: FSMContext):
 
     await message.answer(
         f"✅ **Ваш пост с конкурсом готов! (ID: `{giveaway_id}`)**\n"
-        f"Завершить конкурс и выбрать победителя: `/finish {giveaway_id}`\n\n"
+        f"Завершить: `/finish {giveaway_id}` | Переролл: `/reroll {giveaway_id}`\n\n"
         f"Перешлите пост ниже в свой канал:",
         parse_mode="Markdown"
     )
