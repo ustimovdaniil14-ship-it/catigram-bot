@@ -46,6 +46,12 @@ esc = html.escape
 OK_STATUSES = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
 
 
+@dp.update.outer_middleware()
+async def log_updates(handler, event, data):
+    log.info("update: %s", getattr(event, "event_type", "?"))
+    return await handler(event, data)
+
+
 class GiveawayForm(StatesGroup):
     mode = State()
     prize_type = State()
@@ -87,7 +93,7 @@ async def init_db(pool):
                 kind TEXT NOT NULL,               -- normal / fast
                 prize TEXT NOT NULL,
                 conditions TEXT,
-                channel_id BIGINT,
+                channel_id TEXT,
                 channel_username TEXT,
                 status TEXT NOT NULL DEFAULT 'active',  -- active / finished
                 next_ticket INT NOT NULL DEFAULT 1,
@@ -104,6 +110,12 @@ async def init_db(pool):
                 PRIMARY KEY (giveaway_id, user_id),
                 UNIQUE (giveaway_id, ticket_number)
             );
+            CREATE TABLE IF NOT EXISTS known_channels (
+                chat_id BIGINT PRIMARY KEY,
+                title TEXT,
+                username TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
             CREATE TABLE IF NOT EXISTS payments (
                 charge_id TEXT PRIMARY KEY,
                 user_id BIGINT NOT NULL,
@@ -112,6 +124,7 @@ async def init_db(pool):
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
         """)
+        await conn.execute("ALTER TABLE giveaways ALTER COLUMN channel_id TYPE TEXT USING channel_id::text")
         await conn.execute(
             "INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING", ADMIN_ID
         )
@@ -172,9 +185,13 @@ def parse_arg(args, prefix):
     return int(m.group(1)) if m else None
 
 
-async def is_subscribed(channel_id: int, user_id: int) -> bool:
+def norm_chat(ref):
+    return int(ref) if re.fullmatch(r"-?\d+", str(ref)) else ref
+
+
+async def is_subscribed(channel_id, user_id: int) -> bool:
     """Бросает TelegramAPIError, если проверить нельзя (бот не админ канала и т.п.)."""
-    member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+    member = await bot.get_chat_member(chat_id=norm_chat(channel_id), user_id=user_id)
     if member.status in OK_STATUSES:
         return True
     if member.status == ChatMemberStatus.RESTRICTED:
@@ -564,54 +581,129 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         await state.clear()
     else:
         await state.update_data(prize=prize)
-        await message.answer("Перешлите сюда <b>любой пост из вашего канала</b>.\n"
-                             "⚠️ Бот должен быть <b>администратором</b> этого канала — иначе проверка подписки не работает.")
+        await show_channels(message, message.from_user.id)
         await state.set_state(GiveawayForm.channel_username)
 
 
-def extract_forward_chat(message: types.Message):
-    """Достаёт чат-источник пересылки в любом формате (новом или старом)."""
-    d = message.model_dump(exclude_none=True)
-    fo = d.get("forward_origin")
-    if isinstance(fo, dict) and isinstance(fo.get("chat"), dict):
-        return fo["chat"], d
-    if isinstance(d.get("forward_from_chat"), dict):
-        return d["forward_from_chat"], d
-    return None, d
+async def save_channel(chat: types.Chat):
+    async with dp["pool"].acquire() as conn:
+        await conn.execute(
+            "INSERT INTO known_channels (chat_id, title, username) VALUES ($1,$2,$3) "
+            "ON CONFLICT (chat_id) DO UPDATE SET title=$2, username=$3, updated_at=now()",
+            chat.id, chat.title, chat.username)
+
+
+@dp.channel_post()
+async def on_channel_post(message: types.Message):
+    await save_channel(message.chat)
+
+
+@dp.my_chat_member()
+async def on_my_chat_member(update: types.ChatMemberUpdated):
+    if update.chat.type != "channel":
+        return
+    if update.new_chat_member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+        await save_channel(update.chat)
+    else:
+        async with dp["pool"].acquire() as conn:
+            await conn.execute("DELETE FROM known_channels WHERE chat_id=$1", update.chat.id)
+
+
+async def user_can_use_channel(user_id: int, chat_id: int) -> bool:
+    if user_id == ADMIN_ID:
+        return True
+    try:
+        m = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
+    except TelegramAPIError:
+        return False
+
+
+async def show_channels(target: types.Message, user_id: int):
+    async with dp["pool"].acquire() as conn:
+        rows = await conn.fetch("SELECT chat_id, title, username FROM known_channels "
+                                "ORDER BY updated_at DESC LIMIT 30")
+    kb = InlineKeyboardBuilder()
+    shown = 0
+    for r in rows:
+        if not await user_can_use_channel(user_id, r["chat_id"]):
+            continue
+        label = f"@{r['username']}" if r["username"] else (r["title"] or str(r["chat_id"]))
+        kb.button(text=f"📢 {label}", callback_data=f"pickch_{r['chat_id']}")
+        shown += 1
+    kb.button(text="🔄 Обновить список", callback_data="refresh_channels")
+    kb.adjust(1)
+    if shown:
+        text = "Выберите канал кнопкой или отправьте <code>@юзернейм</code> / числовой ID канала:"
+    else:
+        text = ("Отправьте <code>@юзернейм</code> канала (например, <code>@PavelBet</code>) "
+                "или его числовой ID.\n\n"
+                "⚠️ Бот должен быть <b>администратором</b> этого канала.")
+    await target.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(GiveawayForm.channel_username, F.data == "refresh_channels")
+async def refresh_channels(callback: types.CallbackQuery):
+    await callback.answer()
+    await show_channels(callback.message, callback.from_user.id)
+
+
+async def accept_channel(target: types.Message, state: FSMContext, user_id: int, chat_ref, label: str) -> bool:
+    """Проверяет, что бот (и создатель) админы канала, и переходит к условиям."""
+    try:
+        me = await bot.get_me()
+        bm = await bot.get_chat_member(chat_id=chat_ref, user_id=me.id)
+        if bm.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+            raise ValueError("бот не админ канала")
+        if user_id != ADMIN_ID:
+            um = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
+            if um.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+                raise ValueError("вы не админ этого канала")
+    except (TelegramAPIError, ValueError) as e:
+        await target.answer(f"❌ Не получилось: <code>{esc(str(e))}</code>\n"
+                            "Проверьте, что бот добавлен админом канала.")
+        return False
+    await state.update_data(channel_id=str(chat_ref), channel_username=label)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить (только подписка)", callback_data="skip_conditions")
+    await target.answer(f"✅ Канал: <b>{esc(label)}</b>\n\nУкажите дополнительные условия (или нажмите кнопку):",
+                        reply_markup=kb.as_markup())
+    await state.set_state(GiveawayForm.conditions)
+    return True
+
+
+@dp.callback_query(GiveawayForm.channel_username, F.data.regexp(r"^pickch_-?\d+$"))
+async def pick_channel(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    chat_id = int(callback.data.split("_", 1)[1])
+    async with dp["pool"].acquire() as conn:
+        row = await conn.fetchrow("SELECT title, username FROM known_channels WHERE chat_id=$1", chat_id)
+    if not row:
+        await callback.message.answer("⚠️ Канал не найден, обновите список.")
+        return
+    label = f"@{row['username']}" if row["username"] else (row["title"] or str(chat_id))
+    await accept_channel(callback.message, state, callback.from_user.id, chat_id, label)
 
 
 @dp.message(GiveawayForm.channel_username)
-async def process_channel(message: types.Message, state: FSMContext):
-    fchat, raw = extract_forward_chat(message)
-    if fchat is None:
-        log.warning("Пересылка не распознана: %s", raw)
-        fwd = {k: v for k, v in raw.items() if "forward" in k}
-        await message.answer("⚠️ Не вижу, из какого канала пост. Перешлите <b>пост из канала</b> "
-                             "(не от пользователя).\n\n"
-                             f"Что пришло: <code>{esc(str(fwd) if fwd else 'нет данных о пересылке')}</code>")
+async def channel_step_text(message: types.Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    chat_ref, label = None, None
+    if re.fullmatch(r"-?\d{6,}", txt):
+        chat_ref, label = int(txt), txt
+    elif re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,31}", txt):
+        chat_ref = label = "@" + txt.lstrip("@")
+    else:
+        await message.answer("⚠️ Отправьте <code>@юзернейм</code> канала или его числовой ID.")
+        await show_channels(message, message.from_user.id)
         return
-    if fchat.get("type") != "channel":
-        await message.answer("❌ Это не канал. Перешлите пост из канала:")
-        return
-    chat_id, username, title = fchat["id"], fchat.get("username"), fchat.get("title")
-
-    try:
-        me = await bot.get_me()
-        bm = await bot.get_chat_member(chat_id=chat_id, user_id=me.id)
-        if bm.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-            raise ValueError("not admin")
-    except (TelegramAPIError, ValueError) as e:
-        await message.answer("❌ Бот не админ в этом канале или не может с ним работать.\n"
-                             f"Ошибка: <code>{esc(str(e))}</code>")
-        return
-
-    label = f"@{username}" if username else (title or str(chat_id))
-    await state.update_data(channel_id=chat_id, channel_username=label)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⏭ Пропустить (только подписка)", callback_data="skip_conditions")
-    await message.answer(f"✅ Канал: <b>{esc(label)}</b>\n\nУкажите дополнительные условия (или нажмите кнопку):",
-                         reply_markup=kb.as_markup())
-    await state.set_state(GiveawayForm.conditions)
+    try:  # красивое название и числовой ID, если сервер это умеет
+        chat = await bot.get_chat(chat_id=chat_ref)
+        chat_ref = chat.id
+        label = f"@{chat.username}" if chat.username else (chat.title or label)
+    except TelegramAPIError as e:
+        log.info("get_chat(%s) не сработал: %s", chat_ref, e)
+    await accept_channel(message, state, message.from_user.id, chat_ref, label)
 
 
 @dp.callback_query(GiveawayForm.conditions, F.data == "skip_conditions")
