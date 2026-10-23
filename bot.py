@@ -103,6 +103,7 @@ async def init_db(pool):
                 PRIMARY KEY (giveaway_id, user_id),
                 UNIQUE (giveaway_id, ticket_number)
             )""")
+        await conn.execute("CREATE TABLE IF NOT EXISTS sub_ack (user_id BIGINT PRIMARY KEY)")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS payments (
                 charge_id TEXT PRIMARY KEY,
@@ -166,6 +167,8 @@ def norm_code(s: str) -> str:
     return " ".join((s or "").split()).casefold()
 
 
+REQUIRED_CHANNELS = ["PavelBet", "plushpepeholders"]
+
 BTN_NEW = "➕ Создать конкурс"
 BTN_MY = "📋 Мои конкурсы"
 BTN_FINISH = "🏁 Итоги"
@@ -212,7 +215,7 @@ async def cmd_myid(message: types.Message):
     await message.answer(f"🆔 Твой ID: <code>{message.from_user.id}</code>")
 
 
-async def begin_join(message: types.Message, state: FSMContext, gid: int):
+async def begin_join(message: types.Message, state: FSMContext, user: types.User, gid: int):
     pool = dp["pool"]
     g = await get_giveaway(pool, gid)
     if not g or g["kind"] != "normal":
@@ -224,12 +227,12 @@ async def begin_join(message: types.Message, state: FSMContext, gid: int):
     async with pool.acquire() as conn:
         ticket = await conn.fetchval(
             "SELECT ticket_number FROM giveaway_participants WHERE giveaway_id=$1 AND user_id=$2",
-            gid, message.from_user.id)
+            gid, user.id)
     if ticket:
         await message.answer(f"ℹ️ Вы уже зарегистрированы. Ваш номер: <b>#{ticket}</b>")
         return
     if not g["code"]:  # старые конкурсы без кодового слова
-        t, _ = await add_participant(pool, gid, message.from_user.id, message.from_user.username)
+        t, _ = await add_participant(pool, gid, user.id, user.username)
         await message.answer(f"🎉 Вы успешно участвуете! Ваш номер: <b>#{t}</b>")
         return
     await state.set_state(JoinForm.code)
@@ -237,12 +240,44 @@ async def begin_join(message: types.Message, state: FSMContext, gid: int):
     await message.answer(f"🔑 Конкурс <b>#{gid}</b>\nВведите кодовое слово из поста/канала:")
 
 
+async def has_ack(pool, user_id: int) -> bool:
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT 1 FROM sub_ack WHERE user_id=$1", user_id) is not None
+
+
+async def send_gate(message: types.Message, args):
+    kb = InlineKeyboardBuilder()
+    for name in REQUIRED_CHANNELS:
+        kb.button(text=f"📢 @{name}", url=f"{LINK_BASE}/{name}")
+    kb.button(text="✅ Я подписался", callback_data=f"subok:{args or ''}")
+    kb.adjust(1)
+    chans = "\n".join(f"• @{n}" for n in REQUIRED_CHANNELS)
+    await message.answer(f"📢 Чтобы пользоваться ботом, подпишитесь на наши каналы:\n\n{chans}\n\n"
+                         f"После подписки нажмите кнопку ниже 👇", reply_markup=kb.as_markup())
+
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
     await state.clear()
-    pool = dp["pool"]
     user = message.from_user
-    args = command.args
+    if user.id != ADMIN_ID and not await has_ack(dp["pool"], user.id):
+        await send_gate(message, command.args)
+        return
+    await process_start(message, state, user, command.args)
+
+
+@dp.callback_query(F.data.startswith("subok"))
+async def sub_ok(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    args = callback.data.split(":", 1)[1] if ":" in callback.data else ""
+    async with dp["pool"].acquire() as conn:
+        await conn.execute("INSERT INTO sub_ack (user_id) VALUES ($1) ON CONFLICT DO NOTHING", callback.from_user.id)
+    await process_start(callback.message, state, callback.from_user, args or None)
+
+
+async def process_start(message: types.Message, state: FSMContext, user: types.User, args):
+    pool = dp["pool"]
 
     gid = parse_arg(args, "fast")
     if gid is not None:
@@ -272,7 +307,7 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
 
     gid = parse_arg(args, "join")
     if gid is not None:
-        await begin_join(message, state, gid)
+        await begin_join(message, state, user, gid)
         return
 
     creator = await is_creator(pool, user.id)
