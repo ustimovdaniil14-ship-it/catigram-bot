@@ -30,12 +30,15 @@ session = AiohttpSession(api=catigram_server)
 bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- Состояния конструктора ---
+# --- Состояния ---
 class GiveawayForm(StatesGroup):
     mode = State()          
     prize_type = State()    
     prize_details = State() 
     conditions = State()    
+
+class DonateForm(StatesGroup):
+    amount = State()
 
 # --- База данных (PostgreSQL / Neon) ---
 async def get_db_pool():
@@ -65,7 +68,6 @@ async def init_db(pool):
                 prize_details TEXT
             );
         """)
-        # Автоматически добавляем твой ID в создатели
         await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", ADMIN_ID)
 
 async def is_creator(pool, user_id):
@@ -116,7 +118,7 @@ async def claim_fast_click(pool, giveaway_id, user_id, username):
         )
         return "win", prize_details, creator_id
 
-# --- Веб-сервер-заглушка для Render (чтобы статус всегда был Live) ---
+# --- Веб-сервер-заглушка для Render ---
 async def handle_ping(request):
     return web.Response(text="Bot is alive!")
 
@@ -151,7 +153,6 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     user_id = message.from_user.id
     args = command.args
 
-    # Фаст-клик клик
     if args and args.startswith("fast_"):
         giveaway_id = int(args.split("_")[1])
         status, prize, creator_id = await claim_fast_click(pool, giveaway_id, user_id, message.from_user.username)
@@ -182,7 +183,6 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             await message.answer("⚠️ Розыгрыш не найден или завершён.")
         return
 
-    # Обычный конкурс (кнопка активна у всех)
     if args and args.startswith("join_"):
         giveaway_id = int(args.split("_")[1])
         success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
@@ -197,17 +197,22 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
         return
 
     if await is_creator(pool, user_id):
+        builder = InlineKeyboardBuilder()
+        builder.button(text="💖 Поддержать автора (Пожертвование)", callback_data="donate_stars")
+        
         await message.answer(
             "👋 **Привет, Создатель!**\n\n"
             "У тебя есть доступ к созданию розыгрышей.\n"
             "Чтобы создать конкурс, используй команду:\n"
             "👉 /new_giveaway\n\n"
             "Чтобы подвести итоги конкурса:\n"
-            "👉 `/finish <ID_конкурса>`"
+            "👉 `/finish <ID_конкурса>`",
+            reply_markup=builder.as_markup()
         )
     else:
         builder = InlineKeyboardBuilder()
         builder.button(text=f"⭐️ Купить доступ — {PRICE_STARS} ⭐️", callback_data="buy_access")
+        builder.button(text="💖 Пожертвовать звёзды", callback_data="donate_stars")
         builder.button(text=f"💬 Написать {ADMIN_USERNAME}", url=f"https://t.me/{ADMIN_USERNAME.replace('@', '')}")
         builder.adjust(1)
 
@@ -218,6 +223,35 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             reply_markup=builder.as_markup()
         )
 
+# --- Пожертвования (Донат) ---
+@dp.callback_query(F.data == "donate_stars")
+async def start_donate(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("💖 **Пожертвование автору**\n\nВведите количество звёзд ⭐️, которое вы хотите пожертвовать (**только цифрами**, например: `50`, `100`, `500`):")
+    await state.set_state(DonateForm.amount)
+    await callback.answer()
+
+@dp.message(DonateForm.amount)
+async def process_donate_amount(message: types.Message, state: FSMContext):
+    text_input = message.text.strip() if message.text else ""
+    if not text_input.isdigit() or int(text_input) <= 0:
+        await message.answer("⚠️ Ошибка! Введите корректное число звёзд (только цифры, больше 0):")
+        return
+
+    amount = int(text_input)
+    prices = [types.LabeledPrice(label="Пожертвование проекту", amount=amount)]
+    
+    await bot.send_invoice(
+        chat_id=message.from_user.id,
+        title="Пожертвование автору 💖",
+        description=f"Добровольное пожертвование в размере {amount} Telegram Stars.",
+        payload=f"donate_{message.from_user.id}",
+        currency="XTR",
+        prices=prices,
+        provider_token=""
+    )
+    await state.clear()
+
+# --- Покупка доступа ---
 @dp.callback_query(F.data == "buy_access")
 async def buy_access_callback(callback: types.CallbackQuery):
     prices = [types.LabeledPrice(label="Доступ к созданию розыгрышей", amount=PRICE_STARS)]
@@ -239,9 +273,15 @@ async def pre_checkout_handler(pre_checkout_query: types.PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def payment_success(message: types.Message):
     pool = dp["pool"]
-    await add_creator(pool, message.from_user.id)
-    await message.answer("🎉 **Оплата прошла успешно!** Теперь тебе доступно создание розыгрышей.")
+    payload = message.successful_payment.invoice_payload
+    
+    if payload.startswith("donate_"):
+        await message.answer("💖 **Огромное спасибо за вашу поддержку!** Ваши звёзды очень помогают проекту развиваться!")
+    else:
+        await add_creator(pool, message.from_user.id)
+        await message.answer("🎉 **Оплата прошла успешно!** Теперь тебе доступно создание розыгрышей.")
 
+# --- Выдача доступа админом ---
 @dp.message(Command("give_access"))
 async def cmd_give_access(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -257,7 +297,11 @@ async def cmd_give_access(message: types.Message):
         else:
             await message.answer(f"✅ Бесплатный доступ **успешно выдан** пользователю `{target_id}`!")
             try:
-                await bot.send_message(target_id, "🎉 Администратор выдал вам бесплатный доступ к созданию розыгрышей!")
+                await bot.send_message(
+                    target_id, 
+                    f"🎉 Главный администратор {ADMIN_USERNAME} выдал вам бесплатный доступ к созданию розыгрышей навсегда!\n\n"
+                    f"Используйте команду /new_giveaway для создания первого конкурса."
+                )
             except Exception:
                 pass
     else:
@@ -340,7 +384,7 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
 async def process_prize_details(message: types.Message, state: FSMContext):
     pool = dp["pool"]
     user_data = await state.get_data()
-    prize_type = user_data["prize_type"]
+    prize_type = user_data.get("prize_type")
     text_input = message.text.strip() if message.text else ""
 
     if prize_type == "Обычный":
@@ -356,7 +400,7 @@ async def process_prize_details(message: types.Message, state: FSMContext):
 
     await state.update_data(prize_details=prize_details)
 
-    if user_data["mode"] == "fast":
+    if user_data.get("mode") == "fast":
         giveaway_id = random.randint(1000, 9999)
         bot_info = await bot.get_me()
         bot_username = bot_info.username
@@ -384,8 +428,8 @@ async def process_prize_details(message: types.Message, state: FSMContext):
 @dp.message(GiveawayForm.conditions)
 async def process_conditions(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
-    prize_type = user_data["prize_type"]
-    prize_details = user_data["prize_details"]
+    prize_type = user_data.get("prize_type")
+    prize_details = user_data.get("prize_details")
     conditions = message.text.strip() if message.text else "Подписка на канал"
 
     giveaway_id = random.randint(100, 999)
@@ -424,7 +468,6 @@ async def main():
     await init_db(pool)
     dp["pool"] = pool
     
-    # Запуск заглушки порта для Render
     await start_dummy_server()
     
     await set_main_menu(bot)
