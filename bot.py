@@ -16,7 +16,7 @@ BOT_TOKEN = "1780243771:Gb_eq0_l0bqdqxSG5aU1zTnkyVSUjHnETPp"
 ADMIN_ID = 1780243771
 ADMIN_USERNAME = "@Pavelmanager"
 
-PRICE_STARS = 600  # Цена доступа
+PRICE_STARS = 600  # Цена доступа к созданию
 
 # Подключение к Neon PostgreSQL
 DATABASE_URL = "postgresql://neondb_owner:npg_pWVDXMBAHT90@ep-jolly-heart-b5c4ag91-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
@@ -134,6 +134,7 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
     user_id = message.from_user.id
     args = command.args
 
+    # Переход по кнопке Фаст-Клика
     if args and args.startswith("fast_"):
         giveaway_id = int(args.split("_")[1])
         status, prize, creator_id = await claim_fast_click(pool, giveaway_id, user_id, message.from_user.username)
@@ -164,6 +165,7 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
             await message.answer("⚠️ Розыгрыш не найден или завершён.")
         return
 
+    # Переход по кнопке участия в обычном конкурсе
     if args and args.startswith("join_"):
         giveaway_id = int(args.split("_")[1])
         success = await add_participant(pool, giveaway_id, user_id, message.from_user.username)
@@ -268,7 +270,7 @@ async def cmd_finish(message: types.Message):
         parse_mode="Markdown"
     )
 
-# --- Конструктор розыгрышей (По кнопкам) ---
+# --- Конструктор розыгрышей ---
 @dp.message(Command("new_giveaway"))
 async def cmd_new_giveaway(message: types.Message, state: FSMContext):
     pool = dp["pool"]
@@ -306,7 +308,7 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
     if prize_type == "NFT":
         await callback.message.answer("🔗 Отправьте ссылку на ваш **NFT**:")
     else:
-        await callback.message.answer("✏️ Напишите название или количество приза (например: `500 Stars`):")
+        await callback.message.answer("✏️ Напишите название приза (например: `500 Stars`):")
 
     await state.set_state(GiveawayForm.prize_details)
     await callback.answer()
@@ -343,7 +345,7 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
         await state.clear()
     else:
-        await message.answer("📌 **Укажите условия для участия**\n(например: `Подписка на канал @mychannel`):")
+        await message.answer("📌 **Укажите условия для участия**\n(например: `Подписка на канал`):")
         await state.set_state(GiveawayForm.conditions)
 
 @dp.message(GiveawayForm.conditions)
