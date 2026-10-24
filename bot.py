@@ -3,6 +3,7 @@ import html
 import logging
 import os
 import re
+import time
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
@@ -36,11 +37,19 @@ PORT = int(os.getenv("PORT", "10000"))
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("giveaway")
 
-session = AiohttpSession(api=TelegramAPIServer.from_base(CATIGRAM_API_URL))
+session = AiohttpSession(api=TelegramAPIServer.from_base(CATIGRAM_API_URL), timeout=20)
 bot = Bot(token=BOT_TOKEN, session=session,
           default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 esc = html.escape
+
+
+async def quick_answer(callback: types.CallbackQuery, *args, **kwargs):
+    """answerCallbackQuery иногда подвисает на сервере Catugram — не ждём его дольше 3 секунд."""
+    try:
+        await asyncio.wait_for(callback.answer(*args, **kwargs), timeout=3)
+    except Exception as e:
+        log.warning("callback.answer не прошёл: %r", e)
 
 
 class GiveawayForm(StatesGroup):
@@ -122,18 +131,38 @@ async def init_db(pool):
         await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING", ADMIN_ID)
 
 
+# --- кэш, чтобы не ходить в базу на каждое сообщение (ускоряет ответы) ---
+_creator_cache: dict = {}   # user_id -> (значение, до какого времени верно)
+_ack_cache: set = set()     # кто уже подтвердил подписку
+_me_cache = None
+
+
+async def get_me_cached():
+    global _me_cache
+    if _me_cache is None:
+        _me_cache = await bot.get_me()
+    return _me_cache
+
+
 async def is_creator(pool, user_id) -> bool:
     if user_id == ADMIN_ID:
         return True
+    now = time.monotonic()
+    hit = _creator_cache.get(user_id)
+    if hit and hit[1] > now:
+        return hit[0]
     async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT 1 FROM creators WHERE user_id=$1", user_id) is not None
+        val = await conn.fetchval("SELECT 1 FROM creators WHERE user_id=$1", user_id) is not None
+    _creator_cache[user_id] = (val, now + 30)
+    return val
 
 
 async def add_creator(pool, user_id) -> bool:
     """True, если доступ уже был."""
     async with pool.acquire() as conn:
         res = await conn.execute("INSERT INTO creators (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
-        return res.endswith(" 0")
+    _creator_cache.pop(user_id, None)
+    return res.endswith(" 0")
 
 
 async def get_giveaway(pool, gid):
@@ -174,7 +203,14 @@ def norm_code(s: str) -> str:
     return " ".join((s or "").split()).casefold()
 
 
-MEDALS = ["🥇", "🥈", "🥉"]
+MEDALS = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+MAX_WINNERS = 10
+MAX_NFT_PER_PLACE = 10
+
+
+def ru_people(n: int) -> str:
+    return "человека" if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14) else "человек"
+
 REQUIRED_CHANNELS = ["PavelBet", "plushpepeholders"]
 
 BTN_NEW = "➕ Создать конкурс"
@@ -254,8 +290,13 @@ async def begin_join(message: types.Message, state: FSMContext, user: types.User
 
 
 async def has_ack(pool, user_id: int) -> bool:
+    if user_id in _ack_cache:
+        return True
     async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT 1 FROM sub_ack WHERE user_id=$1", user_id) is not None
+        ok = await conn.fetchval("SELECT 1 FROM sub_ack WHERE user_id=$1", user_id) is not None
+    if ok:
+        _ack_cache.add(user_id)
+    return ok
 
 
 async def send_gate(message: types.Message, args):
@@ -281,11 +322,12 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
 
 @dp.callback_query(F.data.startswith("subok"))
 async def sub_ok(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
+    await quick_answer(callback)
     await state.clear()
     args = callback.data.split(":", 1)[1] if ":" in callback.data else ""
     async with dp["pool"].acquire() as conn:
         await conn.execute("INSERT INTO sub_ack (user_id) VALUES ($1) ON CONFLICT DO NOTHING", callback.from_user.id)
+    _ack_cache.add(callback.from_user.id)
     await process_start(callback.message, state, callback.from_user, args or None)
 
 
@@ -418,7 +460,7 @@ async def btn_draw_list(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.regexp(r"^draw_(finish|reroll)_(\d+)$"))
 async def draw_callback(callback: types.CallbackQuery):
     _, mode, gid = callback.data.split("_")
-    await callback.answer()
+    await quick_answer(callback)
     if not await is_creator(dp["pool"], callback.from_user.id):
         return
     await run_draw(callback.message, callback.from_user.id, int(gid), reroll=(mode == "reroll"))
@@ -482,7 +524,7 @@ async def send_nft_instructions(message: types.Message, user: types.User):
 
 @dp.callback_query(F.data == "buy_nft")
 async def buy_nft_callback(callback: types.CallbackQuery):
-    await callback.answer()
+    await quick_answer(callback)
     await send_nft_instructions(callback.message, callback.from_user)
 
 
@@ -588,7 +630,7 @@ async def btn_all(message: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data.regexp(r"^adm_g_\d+$"))
 async def adm_game_details(callback: types.CallbackQuery):
-    await callback.answer()
+    await quick_answer(callback)
     if callback.from_user.id != ADMIN_ID:
         return
     gid = int(callback.data.rsplit("_", 1)[1])
@@ -613,7 +655,7 @@ async def adm_game_details(callback: types.CallbackQuery):
                                  "WHERE giveaway_id=$1 AND place IS NOT NULL ORDER BY place", gid)
     if wrows:
         lines.append("🏆 Победители:")
-        lines += [f"{MEDALS[min(r['place'], 3) - 1]} {r['place']} — {mention(r['user_id'], r['username'])} "
+        lines += [f"{MEDALS[min(r['place'], 10) - 1]} {r['place']} — {mention(r['user_id'], r['username'])} "
                   f"(<code>{r['user_id']}</code>)" for r in wrows]
     elif g["winner_id"]:
         lines.append(f"🏆 Победитель: {mention(g['winner_id'], g['winner_username'])} (<code>{g['winner_id']}</code>)")
@@ -627,7 +669,7 @@ async def adm_game_details(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.regexp(r"^adm_p_\d+$"))
 async def adm_participants(callback: types.CallbackQuery):
-    await callback.answer()
+    await quick_answer(callback)
     if callback.from_user.id != ADMIN_ID:
         return
     gid = int(callback.data.rsplit("_", 1)[1])
@@ -647,7 +689,7 @@ async def adm_participants(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.regexp(r"^adm_d_\d+$"))
 async def adm_delete_ask(callback: types.CallbackQuery):
-    await callback.answer()
+    await quick_answer(callback)
     if callback.from_user.id != ADMIN_ID:
         return
     gid = int(callback.data.rsplit("_", 1)[1])
@@ -661,7 +703,7 @@ async def adm_delete_ask(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.regexp(r"^adm_dy_\d+$"))
 async def adm_delete_do(callback: types.CallbackQuery):
-    await callback.answer()
+    await quick_answer(callback)
     if callback.from_user.id != ADMIN_ID:
         return
     gid = int(callback.data.rsplit("_", 1)[1])
@@ -672,7 +714,7 @@ async def adm_delete_do(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm_dn")
 async def adm_delete_cancel(callback: types.CallbackQuery):
-    await callback.answer("Отменено")
+    await quick_answer(callback, "Отменено")
 
 
 @dp.message(F.text == BTN_PAY)
@@ -716,7 +758,7 @@ async def admin_broadcast_text(message: types.Message, state: FSMContext):
 
 @dp.callback_query(AdminForm.confirm, F.data == "bc_no")
 async def bc_cancel(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer("Отменено")
+    await quick_answer(callback, "Отменено")
     await state.clear()
 
 
@@ -738,7 +780,7 @@ async def run_broadcast(message: types.Message, text: str):
 
 @dp.callback_query(AdminForm.confirm, F.data == "bc_yes")
 async def bc_send(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
+    await quick_answer(callback)
     if callback.from_user.id != ADMIN_ID:
         return
     text = (await state.get_data()).get("bc_text")
@@ -774,7 +816,7 @@ async def admin_revoke(message: types.Message, state: FSMContext):
 async def start_donate(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите количество звёзд для пожертвования (только цифры):")
     await state.set_state(DonateForm.amount)
-    await callback.answer()
+    await quick_answer(callback)
 
 
 @dp.message(DonateForm.amount)
@@ -797,7 +839,7 @@ async def buy_access_callback(callback: types.CallbackQuery):
         chat_id=callback.from_user.id, title="Доступ к боту", description="Покупка доступа",
         payload=f"access_{callback.from_user.id}", currency="XTR",
         prices=[types.LabeledPrice(label="Доступ", amount=PRICE_STARS)], provider_token="")
-    await callback.answer()
+    await quick_answer(callback)
 
 
 @dp.pre_checkout_query()
@@ -842,6 +884,7 @@ async def revoke_access(message: types.Message, target: int):
         return
     async with dp["pool"].acquire() as conn:
         await conn.execute("DELETE FROM creators WHERE user_id=$1", target)
+    _creator_cache.pop(target, None)
     await message.answer(f"✅ Доступ у <code>{target}</code> отозван.")
 
 
@@ -956,7 +999,7 @@ async def run_draw(message: types.Message, user_id: int, gid: int, reroll: bool,
 
 @dp.callback_query(F.data.regexp(r"^rrp_\d+_\d+$"))
 async def reroll_place_callback(callback: types.CallbackQuery):
-    await callback.answer()
+    await quick_answer(callback)
     _, gid, place = callback.data.split("_")
     if not await is_creator(dp["pool"], callback.from_user.id):
         return
@@ -1031,26 +1074,31 @@ async def ask_prize_type(message: types.Message, state: FSMContext):
 def prize_prompt(prize_type: str, place: int, total: int) -> str:
     suffix = f" для {place} места" if total > 1 else ""
     if prize_type == "NFT":
-        return f"Отправьте ссылку на NFT{suffix}:"
+        return (f"Отправьте ссылку на NFT{suffix}.\n"
+                f"Можно несколько (до {MAX_NFT_PER_PLACE}) — каждую с новой строки в одном сообщении:")
     return f"Введите количество звёзд цифрами{suffix}:"
 
 
 @dp.callback_query(GiveawayForm.mode, F.data.in_(["mode_normal", "mode_fast"]))
 async def process_mode(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
+    await quick_answer(callback)
     await state.update_data(mode="fast" if callback.data == "mode_fast" else "normal", prizes=[])
     kb = InlineKeyboardBuilder()
-    kb.button(text="🥇 1 победитель", callback_data="winners_1")
-    kb.button(text="🥇🥈 2 победителя", callback_data="winners_2")
-    kb.adjust(1)
-    await callback.message.answer("Сколько будет победителей?", reply_markup=kb.as_markup())
+    for i in range(1, MAX_WINNERS + 1):
+        kb.button(text=str(i), callback_data=f"winners_{i}")
+    kb.adjust(5)
+    await callback.message.answer(f"Сколько будет победителей? (от 1 до {MAX_WINNERS})",
+                                  reply_markup=kb.as_markup())
     await state.set_state(GiveawayForm.winners)
 
 
-@dp.callback_query(GiveawayForm.winners, F.data.in_(["winners_1", "winners_2"]))
+@dp.callback_query(GiveawayForm.winners, F.data.regexp(r"^winners_\d+$"))
 async def process_winners(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.update_data(winners=int(callback.data.split("_")[1]), prizes=[])
+    await quick_answer(callback)
+    n = int(callback.data.split("_")[1])
+    if not 1 <= n <= MAX_WINNERS:
+        return
+    await state.update_data(winners=n, prizes=[])
     await ask_prize_type(callback.message, state)
 
 
@@ -1061,7 +1109,7 @@ async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await callback.message.answer(prize_prompt(ptype, 1, data.get("winners", 1)))
     await state.set_state(GiveawayForm.prize_details)
-    await callback.answer()
+    await quick_answer(callback)
 
 
 @dp.message(GiveawayForm.prize_details)
@@ -1074,19 +1122,33 @@ async def process_prize_details(message: types.Message, state: FSMContext):
             return
         prize = f"{txt} Stars"
     else:
-        m = re.fullmatch(r"(?:https?://)?tg\.catup\.lol/nft/([A-Za-z0-9_-]+)/?", txt, re.IGNORECASE)
-        if not m:
-            await message.answer("⚠️ Нужна ссылка на NFT вида:\n"
-                                 "<code>tg.catup.lol/nft/lolpop-14</code>")
+        pat = r"(?:https?://)?tg\.catup\.lol/nft/([A-Za-z0-9_-]+)/?"
+        found = re.findall(pat, txt, re.IGNORECASE)
+        leftover = re.sub(pat, "", txt, flags=re.IGNORECASE).strip(" ,;\n\t\r")
+        if not found or leftover:
+            await message.answer("⚠️ Нужны ссылки на NFT вида:\n"
+                                 "<code>tg.catup.lol/nft/lolpop-14</code>\n"
+                                 f"Можно несколько (до {MAX_NFT_PER_PLACE}), каждую с новой строки.")
             return
-        prize = f"NFT (https://tg.catup.lol/nft/{m.group(1)})"
+        urls = list(dict.fromkeys(f"https://tg.catup.lol/nft/{name}" for name in found))
+        if len(urls) > MAX_NFT_PER_PLACE:
+            await message.answer(f"⚠️ Максимум {MAX_NFT_PER_PLACE} NFT на одно место. Отправьте не больше:")
+            return
+        used = " ".join(data.get("prizes", []))
+        dup = [u for u in urls if u in used]
+        if dup:
+            await message.answer(f"⚠️ Эта ссылка уже указана для другого места: {esc(dup[0])}\nОтправьте другие:")
+            return
+        prize = f"NFT ({urls[0]})" if len(urls) == 1 else f"NFT ×{len(urls)} ({', '.join(urls)})"
 
     n = data.get("winners", 1)
     prizes = list(data.get("prizes", []))
-    if data["prize_type"] == "NFT" and prize in prizes:
-        await message.answer("⚠️ Эта ссылка уже указана для другого места. Отправьте другую:")
-        return
     prizes.append(prize)
+    if len(" | ".join(prizes)) > 2800:
+        await message.answer("⚠️ Слишком длинный список призов для одного поста. "
+                             "Уменьшите число NFT или победителей и начните заново: «➕ Создать конкурс».")
+        await state.clear()
+        return
     if len(prizes) < n:
         await state.update_data(prizes=prizes)
         await message.answer(prize_prompt(data["prize_type"], len(prizes) + 1, n))
@@ -1098,10 +1160,10 @@ async def process_prize_details(message: types.Message, state: FSMContext):
             gid = await conn.fetchval(
                 "INSERT INTO giveaways (creator_id, kind, prize, winners) VALUES ($1,'fast',$2,$3) RETURNING id",
                 message.from_user.id, full_prize, n)
-        me = await bot.get_me()
+        me = await get_me_cached()
         link = f"{LINK_BASE}/{me.username}?start=fast_{gid}"
         if n > 1:
-            prize_block = f"🎁 Призы (первые {n} человека):\n" + "\n".join(
+            prize_block = f"🎁 Призы (первые {n} {ru_people(n)}):\n" + "\n".join(
                 f"{MEDALS[i]} {i + 1} место: {esc(p)}" for i, p in enumerate(prizes))
         else:
             prize_block = f"Приз: {esc(prizes[0])}"
@@ -1135,7 +1197,7 @@ async def ask_conditions(message: types.Message, state: FSMContext, has_code: bo
 
 @dp.callback_query(GiveawayForm.code_word, F.data == "skip_code")
 async def skip_code_callback(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
+    await quick_answer(callback)
     await state.update_data(code=None)
     await ask_conditions(callback.message, state, has_code=False)
 
@@ -1152,7 +1214,7 @@ async def process_code_word(message: types.Message, state: FSMContext):
 
 @dp.callback_query(GiveawayForm.conditions, F.data == "skip_conditions")
 async def skip_conditions_callback(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
+    await quick_answer(callback)
     await finish_creating_giveaway(callback.message, callback.from_user.id, state, "")
 
 
@@ -1171,7 +1233,7 @@ async def finish_creating_giveaway(message: types.Message, creator_id: int, stat
             "INSERT INTO giveaways (creator_id, kind, prize, conditions, code, winners) "
             "VALUES ($1,'normal',$2,$3,$4,$5) RETURNING id",
             creator_id, data["prize"], conditions, code, data.get("winners", 1))
-    me = await bot.get_me()
+    me = await get_me_cached()
     link = f"{LINK_BASE}/{me.username}?start=join_{gid}"
     await message.answer("Готово! Перешлите это сообщение в канал 👇")
     prizes = data["prize"].split(" | ")
