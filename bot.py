@@ -5,6 +5,7 @@ import os
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import aiohttp
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
@@ -770,12 +771,41 @@ async def join_code(message: types.Message, state: FSMContext):
         await message.answer(f"ℹ️ Вы уже зарегистрированы. Ваш номер: <b>#{ticket}</b>")
 
 
+# ============================== Устойчивость ==============================
+@dp.errors()
+async def on_error(event: types.ErrorEvent):
+    log.exception("Ошибка в обработчике: %r", event.exception)
+    upd = event.update
+    msg = upd.message or (upd.callback_query.message if upd.callback_query else None)
+    if msg:
+        try:
+            await msg.answer("⚠️ Временная ошибка, попробуйте ещё раз.")
+        except Exception:
+            pass
+    return True
+
+
+async def keep_alive():
+    """Render (бесплатный) засыпает без входящих запросов — пингуем сами себя."""
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url:
+        return
+    async with aiohttp.ClientSession() as sess:
+        while True:
+            await asyncio.sleep(300)
+            try:
+                await sess.get(url, timeout=aiohttp.ClientTimeout(total=15))
+            except Exception as e:
+                log.warning("keep_alive: %s", e)
+
+
 # ============================== Запуск ==============================
 async def main():
     pool = await get_db_pool()
     await init_db(pool)
     dp["pool"] = pool
     await start_dummy_server()
+    asyncio.create_task(keep_alive())
     await set_main_menu(bot)
     log.info("Бот запущен!")
     try:
