@@ -26,6 +26,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@Pavelmanager")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@PavelSupport")
 PRICE_STARS = int(os.getenv("PRICE_STARS", "600"))
 CATIGRAM_API_URL = os.getenv("CATIGRAM_API_URL", "http://bot.catup.lol")
 LINK_BASE = os.getenv("LINK_BASE", "https://tg.catup.lol")
@@ -61,6 +62,8 @@ class DonateForm(StatesGroup):
 class AdminForm(StatesGroup):
     give = State()
     revoke = State()
+    broadcast = State()
+    confirm = State()
 
 
 # ============================== База данных ==============================
@@ -178,18 +181,23 @@ BTN_ID = "🆔 Мой ID"
 BTN_DONATE = "💖 Донат"
 BTN_BUY = f"⭐️ Купить доступ ({PRICE_STARS})"
 BTN_ADMIN = "💬 Написать админу"
+BTN_NFT = "🖼 Доступ за NFT"
 BTN_GIVE = "🔑 Выдать доступ"
 BTN_REVOKE = "🚫 Забрать доступ"
 BTN_LIST = "👥 Доступы"
+BTN_STATS = "📈 Статистика"
+BTN_ALL = "🗂 Все конкурсы"
+BTN_PAY = "💰 Платежи"
+BTN_BCAST = "📣 Рассылка"
 
 
 def menu_kb(user_id: int, creator: bool) -> ReplyKeyboardMarkup:
     if creator:
         rows = [[BTN_NEW, BTN_MY], [BTN_FINISH, BTN_REROLL], [BTN_ID, BTN_DONATE]]
         if user_id == ADMIN_ID:
-            rows += [[BTN_GIVE, BTN_REVOKE], [BTN_LIST]]
+            rows += [[BTN_GIVE, BTN_REVOKE], [BTN_LIST, BTN_STATS], [BTN_ALL, BTN_PAY], [BTN_BCAST]]
     else:
-        rows = [[BTN_BUY, BTN_DONATE], [BTN_ID, BTN_ADMIN]]
+        rows = [[BTN_BUY, BTN_NFT], [BTN_DONATE, BTN_ID], [BTN_ADMIN]]
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=t) for t in r] for r in rows], resize_keyboard=True)
 
@@ -318,6 +326,8 @@ async def process_start(message: types.Message, state: FSMContext, user: types.U
         text = ("🔒 Создавать конкурсы могут только пользователи с доступом.\n"
                 "Участвовать в конкурсах можно бесплатно — по ссылке из поста.\n\nМеню внизу 👇")
     await message.answer(text, reply_markup=menu_kb(user.id, creator))
+    if not creator:
+        await send_access_choice(message)
 
 
 # ============================== Кнопки меню ==============================
@@ -393,6 +403,52 @@ async def btn_buy(message: types.Message, state: FSMContext):
         prices=[types.LabeledPrice(label="Доступ", amount=PRICE_STARS)], provider_token="")
 
 
+nft_notified: set = set()
+
+
+async def send_access_choice(message: types.Message):
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"⭐️ Оплатить {PRICE_STARS} звёзд", callback_data="buy_access")
+    kb.button(text="🖼 Оплатить NFT", callback_data="buy_nft")
+    kb.adjust(1)
+    await message.answer("🔑 <b>Доступ к созданию конкурсов</b> (оплата один раз, навсегда).\n"
+                         "Выберите способ:", reply_markup=kb.as_markup())
+
+
+async def send_nft_instructions(message: types.Message, user: types.User):
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"💬 Написать {SUPPORT_USERNAME}", url=f"{LINK_BASE}/{SUPPORT_USERNAME.lstrip('@')}")
+    await message.answer(
+        "🖼 <b>Оплата доступа через NFT</b>\n\n"
+        f"1️⃣ Нажмите в боте кнопку «{BTN_ID}» и скопируйте свой ID\n"
+        f"2️⃣ Отправьте NFT на аккаунт {esc(SUPPORT_USERNAME)}\n"
+        f"3️⃣ <b>Обязательно</b> напишите там, что это оплата <b>для доступа к боту</b>, "
+        f"и пришлите свой ID из бота\n\n"
+        "⏳ Вам ответят в течение 1 часа.", reply_markup=kb.as_markup())
+    if user.id not in nft_notified:
+        nft_notified.add(user.id)
+        try:
+            await bot.send_message(ADMIN_ID, f"🖼 {mention(user.id, user.username)} (<code>{user.id}</code>) "
+                                             f"выбрал оплату доступа через NFT.")
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data == "buy_nft")
+async def buy_nft_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    await send_nft_instructions(callback.message, callback.from_user)
+
+
+@dp.message(F.text == BTN_NFT)
+async def btn_nft(message: types.Message, state: FSMContext):
+    await state.clear()
+    if await is_creator(dp["pool"], message.from_user.id):
+        await message.answer("✅ У вас уже есть доступ.")
+        return
+    await send_nft_instructions(message, message.from_user)
+
+
 @dp.message(F.text == BTN_ADMIN)
 async def btn_admin(message: types.Message, state: FSMContext):
     await state.clear()
@@ -427,6 +483,217 @@ async def btn_list(message: types.Message, state: FSMContext):
     await state.clear()
     if message.from_user.id == ADMIN_ID:
         await list_creators(message)
+
+
+# --- админ: статистика, конкурсы, платежи, рассылка ---
+@dp.message(F.text == BTN_STATS)
+async def btn_stats(message: types.Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id != ADMIN_ID:
+        return
+    async with dp["pool"].acquire() as conn:
+        creators = await conn.fetchval("SELECT count(*) FROM creators")
+        users = await conn.fetchval(
+            "SELECT count(*) FROM (SELECT user_id FROM sub_ack UNION SELECT user_id FROM creators "
+            "UNION SELECT user_id FROM giveaway_participants) t")
+        g = await conn.fetchrow(
+            "SELECT count(*) FILTER (WHERE kind='normal') AS n, count(*) FILTER (WHERE kind='fast') AS f, "
+            "count(*) FILTER (WHERE status='active') AS a, count(*) FILTER (WHERE status='finished') AS d "
+            "FROM giveaways")
+        parts = await conn.fetchval("SELECT count(*) FROM giveaway_participants")
+        p = await conn.fetchrow(
+            "SELECT count(*) FILTER (WHERE payload LIKE 'access%') AS ac, "
+            "coalesce(sum(amount) FILTER (WHERE payload LIKE 'access%'),0) AS asum, "
+            "count(*) FILTER (WHERE payload LIKE 'donate%') AS dc, "
+            "coalesce(sum(amount) FILTER (WHERE payload LIKE 'donate%'),0) AS dsum FROM payments")
+    await message.answer(
+        "📈 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{users}</b>\n"
+        f"🔑 С доступом: <b>{creators}</b>\n"
+        f"🎁 Конкурсов: <b>{g['n'] + g['f']}</b> (обычных {g['n']}, фаст-кликов {g['f']})\n"
+        f"🟢 Активных: {g['a']} · 🔴 завершённых: {g['d']}\n"
+        f"🎟 Участий всего: <b>{parts}</b>\n\n"
+        f"⭐️ Куплено доступов: <b>{p['ac']}</b> ({p['asum']} ⭐)\n"
+        f"💖 Донатов: <b>{p['dc']}</b> ({p['dsum']} ⭐)")
+
+
+@dp.message(F.text == BTN_ALL)
+async def btn_all(message: types.Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id != ADMIN_ID:
+        return
+    async with dp["pool"].acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT g.id, g.kind, g.prize, g.status, "
+            "(SELECT count(*) FROM giveaway_participants p WHERE p.giveaway_id=g.id) AS cnt "
+            "FROM giveaways g ORDER BY g.id DESC LIMIT 15")
+    if not rows:
+        await message.answer("Конкурсов пока нет.")
+        return
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        k = "⚡️" if r["kind"] == "fast" else "📊"
+        st = "🟢" if r["status"] == "active" else "🔴"
+        extra = f" · {r['cnt']} уч." if r["kind"] == "normal" else ""
+        kb.button(text=f"{k}{st} #{r['id']} · {r['prize'][:18]}{extra}", callback_data=f"adm_g_{r['id']}")
+    kb.adjust(1)
+    await message.answer("🗂 Последние 15 конкурсов. Нажмите, чтобы открыть:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.regexp(r"^adm_g_\d+$"))
+async def adm_game_details(callback: types.CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_ID:
+        return
+    gid = int(callback.data.rsplit("_", 1)[1])
+    g = await get_giveaway(dp["pool"], gid)
+    if not g:
+        await callback.message.answer("⚠️ Конкурс не найден (возможно, удалён).")
+        return
+    async with dp["pool"].acquire() as conn:
+        cnt = await conn.fetchval("SELECT count(*) FROM giveaway_participants WHERE giveaway_id=$1", gid)
+    fast = g["kind"] == "fast"
+    lines = [f"<b>#{gid}</b> · {'⚡️ Фаст-клик' if fast else '📊 Обычный'} · "
+             f"{'🟢 активен' if g['status'] == 'active' else '🔴 завершён'}",
+             f"🎁 {esc(g['prize'])}",
+             f"👤 Создатель: <code>{g['creator_id']}</code>",
+             f"📅 {g['created_at']:%d.%m.%Y %H:%M} UTC"]
+    if not fast:
+        lines.append(f"📌 Условия: {esc(g['conditions'] or '—')}")
+        lines.append(f"🔑 Кодовое слово: {('<code>' + esc(g['code']) + '</code>') if g['code'] else '—'}")
+        lines.append(f"🎟 Участников: <b>{cnt}</b>")
+    if g["winner_id"]:
+        lines.append(f"🏆 Победитель: {mention(g['winner_id'], g['winner_username'])} (<code>{g['winner_id']}</code>)")
+    kb = InlineKeyboardBuilder()
+    if not fast:
+        kb.button(text="👥 Участники", callback_data=f"adm_p_{gid}")
+    kb.button(text="🗑 Удалить конкурс", callback_data=f"adm_d_{gid}")
+    kb.adjust(1)
+    await callback.message.answer("\n".join(lines), reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.regexp(r"^adm_p_\d+$"))
+async def adm_participants(callback: types.CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_ID:
+        return
+    gid = int(callback.data.rsplit("_", 1)[1])
+    async with dp["pool"].acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, username, ticket_number, won FROM giveaway_participants "
+                                "WHERE giveaway_id=$1 ORDER BY ticket_number LIMIT 60", gid)
+        total = await conn.fetchval("SELECT count(*) FROM giveaway_participants WHERE giveaway_id=$1", gid)
+    if not rows:
+        await callback.message.answer("Участников пока нет.")
+        return
+    lines = [f"#{r['ticket_number']} — {mention(r['user_id'], r['username'])} (<code>{r['user_id']}</code>)"
+             f"{' 🏆' if r['won'] else ''}" for r in rows]
+    if total > len(rows):
+        lines.append(f"… и ещё {total - len(rows)}")
+    await callback.message.answer(f"👥 Участники конкурса #{gid} ({total}):\n" + "\n".join(lines))
+
+
+@dp.callback_query(F.data.regexp(r"^adm_d_\d+$"))
+async def adm_delete_ask(callback: types.CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_ID:
+        return
+    gid = int(callback.data.rsplit("_", 1)[1])
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, удалить", callback_data=f"adm_dy_{gid}")
+    kb.button(text="❌ Отмена", callback_data="adm_dn")
+    kb.adjust(1)
+    await callback.message.answer(f"Удалить конкурс #{gid} вместе со всеми участниками? Это нельзя отменить.",
+                                  reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.regexp(r"^adm_dy_\d+$"))
+async def adm_delete_do(callback: types.CallbackQuery):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_ID:
+        return
+    gid = int(callback.data.rsplit("_", 1)[1])
+    async with dp["pool"].acquire() as conn:
+        await conn.execute("DELETE FROM giveaways WHERE id=$1", gid)
+    await callback.message.answer(f"🗑 Конкурс #{gid} удалён.")
+
+
+@dp.callback_query(F.data == "adm_dn")
+async def adm_delete_cancel(callback: types.CallbackQuery):
+    await callback.answer("Отменено")
+
+
+@dp.message(F.text == BTN_PAY)
+async def btn_pay(message: types.Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id != ADMIN_ID:
+        return
+    async with dp["pool"].acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, payload, amount, created_at FROM payments "
+                                "ORDER BY created_at DESC LIMIT 15")
+    if not rows:
+        await message.answer("Платежей пока нет.")
+        return
+    lines = [f"{'⭐️ доступ' if r['payload'].startswith('access') else '💖 донат'} · {r['amount']} ⭐ · "
+             f"<code>{r['user_id']}</code> · {r['created_at']:%d.%m %H:%M}" for r in rows]
+    await message.answer("💰 Последние платежи (время UTC):\n" + "\n".join(lines))
+
+
+@dp.message(F.text == BTN_BCAST)
+async def btn_bcast(message: types.Message, state: FSMContext):
+    await state.clear()
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("📣 Отправьте текст рассылки (получат все, кто пользовался ботом).\n"
+                         "Чтобы отменить — нажмите любую кнопку меню.")
+    await state.set_state(AdminForm.broadcast)
+
+
+@dp.message(AdminForm.broadcast, F.text)
+async def admin_broadcast_text(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.update_data(bc_text=message.text)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Отправить всем", callback_data="bc_yes")
+    kb.button(text="❌ Отмена", callback_data="bc_no")
+    kb.adjust(1)
+    await message.answer(f"Предпросмотр:\n\n{esc(message.text)}", reply_markup=kb.as_markup())
+    await state.set_state(AdminForm.confirm)
+
+
+@dp.callback_query(AdminForm.confirm, F.data == "bc_no")
+async def bc_cancel(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer("Отменено")
+    await state.clear()
+
+
+async def run_broadcast(message: types.Message, text: str):
+    async with dp["pool"].acquire() as conn:
+        ids = [r["user_id"] for r in await conn.fetch(
+            "SELECT user_id FROM sub_ack UNION SELECT user_id FROM creators "
+            "UNION SELECT user_id FROM giveaway_participants")]
+    ok = fail = 0
+    for uid in ids:
+        try:
+            await bot.send_message(uid, esc(text))
+            ok += 1
+        except TelegramAPIError:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await message.answer(f"📣 Рассылка завершена: доставлено <b>{ok}</b>, не доставлено {fail}.")
+
+
+@dp.callback_query(AdminForm.confirm, F.data == "bc_yes")
+async def bc_send(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if callback.from_user.id != ADMIN_ID:
+        return
+    text = (await state.get_data()).get("bc_text")
+    await state.clear()
+    if not text:
+        return
+    await callback.message.answer("⏳ Рассылка началась…")
+    asyncio.create_task(run_broadcast(callback.message, text))
 
 
 @dp.message(AdminForm.give)
