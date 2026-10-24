@@ -235,8 +235,7 @@ async def begin_join(message: types.Message, state: FSMContext, user: types.User
         await message.answer("⚠️ Розыгрыш не найден.")
         return
     if g["status"] != "active":
-        await message.answer("🔒 Приём участников закрыт." if g["status"] == "closed"
-                             else "🔒 Этот конкурс уже завершён.")
+        await message.answer("🔒 Этот конкурс уже завершён.")
         return
     async with pool.acquire() as conn:
         ticket = await conn.fetchval(
@@ -296,7 +295,7 @@ async def claim_fast(message: types.Message, user: types.User, gid: int):
     async with pool.acquire() as conn:
         async with conn.transaction():
             g = await conn.fetchrow(
-                "SELECT creator_id, prize, winners, winner_id, status FROM giveaways "
+                "SELECT creator_id, prize, winners, winner_id FROM giveaways "
                 "WHERE id=$1 AND kind='fast' FOR UPDATE", gid)
             if not g:
                 res = ("missing",)
@@ -313,7 +312,7 @@ async def claim_fast(message: types.Message, user: types.User, gid: int):
                     res = ("mine", mine)
                 elif g["winner_id"] == user.id:
                     res = ("mine", 1)
-                elif taken >= n or g["status"] != "active":
+                elif taken >= n:
                     res = ("full",)
                 else:
                     place = taken + 1
@@ -398,13 +397,12 @@ async def btn_draw_list(message: types.Message, state: FSMContext):
     if not await is_creator(pool, message.from_user.id):
         return
     reroll = message.text == BTN_REROLL
-
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT g.id, g.prize, (SELECT count(*) FROM giveaway_participants p WHERE p.giveaway_id=g.id) AS cnt "
-            "FROM giveaways g WHERE g.creator_id=$1 AND g.kind='normal' AND g.status=ANY($2::text[]) "
+            "FROM giveaways g WHERE g.creator_id=$1 AND g.kind='normal' AND g.status=$2 "
             "ORDER BY g.id DESC LIMIT 10",
-            message.from_user.id, ["finished"] if reroll else ["active", "closed"])
+            message.from_user.id, "finished" if reroll else "active")
     if not rows:
         await message.answer("Нет завершённых конкурсов для реролла." if reroll else "Нет активных конкурсов.")
         return
@@ -581,7 +579,7 @@ async def btn_all(message: types.Message, state: FSMContext):
     kb = InlineKeyboardBuilder()
     for r in rows:
         k = "⚡️" if r["kind"] == "fast" else "📊"
-        st = st_icon(r["status"])
+        st = "🟢" if r["status"] == "active" else "🔴"
         extra = f" · {r['cnt']} уч." if r["kind"] == "normal" else ""
         kb.button(text=f"{k}{st} #{r['id']} · {r['prize'][:18]}{extra}", callback_data=f"adm_g_{r['id']}")
     kb.adjust(1)
@@ -985,60 +983,10 @@ async def cmd_reroll(message: types.Message, command: CommandObject):
     await run_draw(message, message.from_user.id, int(command.args.strip()), reroll=True)
 
 
-def st_icon(status: str) -> str:
-    return {"active": "🟢", "closed": "🟡"}.get(status, "🔴")
-
-
-STATUS_TEXT = {"active": "🟢 идёт приём", "closed": "🟡 приём закрыт", "finished": "🔴 завершён"}
-
-
-async def get_owned(callback: types.CallbackQuery, gid: int):
-    g = await get_giveaway(dp["pool"], gid)
-    if not g or (g["creator_id"] != callback.from_user.id and callback.from_user.id != ADMIN_ID):
-        await callback.message.answer("❌ Конкурс не найден или это не ваш конкурс.")
-        return None
-    if g["status"] == "finished" and callback.from_user.id != ADMIN_ID:
-        await callback.message.answer("🔒 Конкурс завершён — управление им недоступно. Создайте новый конкурс.")
-        return None
-    return g
-
-
-async def build_post(g) -> str:
-    me = await bot.get_me()
-    prizes = g["prize"].split(" | ")
-    many = len(prizes) > 1
-    gid = g["id"]
-    if g["kind"] == "fast":
-        link = f"{LINK_BASE}/{me.username}?start=fast_{gid}"
-        if many:
-            block = f"🎁 Призы (первые {len(prizes)} человека):\n" + "\n".join(
-                f"{MEDALS[i]} {i + 1} место: {esc(p)}" for i, p in enumerate(prizes))
-        else:
-            block = f"Приз: {esc(prizes[0])}"
-        return f"⚡️ <b>Фаст-клик розыгрыш #{gid}!</b>\n{block}\n\n👉 <a href=\"{esc(link)}\">Забрать приз</a>"
-    link = f"{LINK_BASE}/{me.username}?start=join_{gid}"
-    if many:
-        block = "🎁 Призы:\n" + "\n".join(f"{MEDALS[i]} {i + 1} место: {esc(p)}" for i, p in enumerate(prizes))
-    else:
-        block = f"🎁 Приз: {esc(prizes[0])}"
-    return (f"🎉 <b>РОЗЫГРЫШ #{gid}</b> 🎉\n\n{block}\n📌 Условия: {esc(g['conditions'] or '—')}\n\n"
-            f"👉 <a href=\"{esc(link)}\">🎉 Участвовать</a>")
-
-
 @dp.message(Command("my"))
 async def cmd_my(message: types.Message):
     pool = dp["pool"]
     if not await is_creator(pool, message.from_user.id):
-        return
-    if message.from_user.id != ADMIN_ID:
-        async with pool.acquire() as conn:
-            cur = await conn.fetchval(
-                "SELECT id FROM giveaways WHERE creator_id=$1 AND status IN ('active','closed') "
-                "ORDER BY id DESC LIMIT 1", message.from_user.id)
-        if not cur:
-            await message.answer("У вас нет активного конкурса. Создайте новый: «➕ Создать конкурс».")
-        else:
-            await show_my_details(message, cur)
         return
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1046,165 +994,15 @@ async def cmd_my(message: types.Message):
             "(SELECT count(*) FROM giveaway_participants p WHERE p.giveaway_id=g.id) AS cnt "
             "FROM giveaways g WHERE creator_id=$1 ORDER BY id DESC LIMIT 15", message.from_user.id)
     if not rows:
-        await message.answer("У вас пока нет конкурсов. Создайте первый: «➕ Создать конкурс».")
+        await message.answer("У вас пока нет конкурсов.")
         return
-    kb = InlineKeyboardBuilder()
+    lines = []
     for r in rows:
-        k = "⚡️" if r["kind"] == "fast" else "📊"
-        kb.button(text=f"{k}{st_icon(r['status'])} #{r['id']} · {r['prize'][:18]} · {r['cnt']} уч.",
-                  callback_data=f"my_g_{r['id']}")
-    kb.adjust(1)
-    await message.answer("📋 Ваши конкурсы (последние 15). Нажмите, чтобы управлять:", reply_markup=kb.as_markup())
-
-
-async def show_my_details(target: types.Message, gid: int):
-    pool = dp["pool"]
-    g = await get_giveaway(pool, gid)
-    if not g:
-        await target.answer("⚠️ Конкурс не найден (возможно, удалён).")
-        return
-    async with pool.acquire() as conn:
-        cnt = await conn.fetchval("SELECT count(*) FROM giveaway_participants WHERE giveaway_id=$1", gid)
-        wrows = await conn.fetch("SELECT user_id, username, place FROM giveaway_participants "
-                                 "WHERE giveaway_id=$1 AND place IS NOT NULL ORDER BY place", gid)
-    fast = g["kind"] == "fast"
-    n = g["winners"] or 1
-    if fast and cnt == 0 and g["winner_id"]:
-        cnt = 1
-    prizes = g["prize"].split(" | ")
-    lines = [f"<b>#{gid}</b> · {'⚡️ Фаст-клик' if fast else '📊 Обычный'} · "
-             f"{STATUS_TEXT.get(g['status'], g['status'])}"]
-    if len(prizes) > 1:
-        lines.append("🎁 Призы:")
-        lines += [f"{MEDALS[i]} {i + 1} место: {esc(p)}" for i, p in enumerate(prizes)]
-    else:
-        lines.append(f"🎁 Приз: {esc(prizes[0])}")
-    if fast:
-        lines.append(f"⚡️ Забрали: <b>{cnt}</b> из {n}")
-    else:
-        lines.append(f"📌 Условия: {esc(g['conditions'] or '—')}")
-        lines.append(f"🔑 Кодовое слово: {('<code>' + esc(g['code']) + '</code>') if g['code'] else 'нет (в один клик)'}")
-        lines.append(f"🎟 Участников: <b>{cnt}</b>")
-    lines.append(f"📅 {g['created_at']:%d.%m.%Y %H:%M} UTC")
-    if wrows:
-        lines.append("🏆 Победители:" if len(wrows) > 1 else "🏆 Победитель:")
-        lines += [f"{MEDALS[min(r['place'], 3) - 1]} {r['place']} — {mention(r['user_id'], r['username'])} "
-                  f"(<code>{r['user_id']}</code>)" for r in wrows]
-    kb = InlineKeyboardBuilder()
-    kb.button(text="👥 Кто забрал" if fast else "👥 Участники", callback_data=f"my_p_{gid}")
-    if not fast:
-        if g["status"] in ("active", "closed"):
-            kb.button(text="🏁 Подвести итоги", callback_data=f"draw_finish_{gid}")
-            kb.button(text="🔒 Закрыть приём" if g["status"] == "active" else "🔓 Открыть приём",
-                      callback_data=f"my_c_{gid}")
-        else:
-            kb.button(text="🔄 Переролл", callback_data=f"draw_reroll_{gid}")
-    if fast and g["status"] == "active":
-        kb.button(text="⏹ Завершить", callback_data=f"my_f_{gid}")
-    kb.button(text="📨 Повторить пост", callback_data=f"my_post_{gid}")
-    kb.button(text="🔃 Обновить", callback_data=f"my_g_{gid}")
-    kb.button(text="🗑 Удалить", callback_data=f"my_d_{gid}")
-    kb.adjust(2)
-    await target.answer("\n".join(lines), reply_markup=kb.as_markup())
-
-
-@dp.callback_query(F.data.regexp(r"^my_g_\d+$"))
-async def my_open(callback: types.CallbackQuery):
-    await callback.answer()
-    gid = int(callback.data.rsplit("_", 1)[1])
-    if await get_owned(callback, gid):
-        await show_my_details(callback.message, gid)
-
-
-@dp.callback_query(F.data.regexp(r"^my_p_\d+$"))
-async def my_participants(callback: types.CallbackQuery):
-    await callback.answer()
-    gid = int(callback.data.rsplit("_", 1)[1])
-    g = await get_owned(callback, gid)
-    if not g:
-        return
-    async with dp["pool"].acquire() as conn:
-        rows = await conn.fetch("SELECT user_id, username, ticket_number, won FROM giveaway_participants "
-                                "WHERE giveaway_id=$1 ORDER BY ticket_number LIMIT 60", gid)
-        total = await conn.fetchval("SELECT count(*) FROM giveaway_participants WHERE giveaway_id=$1", gid)
-    title = f"👥 Забрали приз в #{gid}" if g["kind"] == "fast" else f"👥 Участники конкурса #{gid}"
-    if not rows:
-        await callback.message.answer(f"{title}: пока никого.")
-        return
-    lines = [f"#{r['ticket_number']} — {mention(r['user_id'], r['username'])} (<code>{r['user_id']}</code>)"
-             f"{' 🏆' if r['won'] else ''}" for r in rows]
-    if total > len(rows):
-        lines.append(f"… и ещё {total - len(rows)}")
-    await callback.message.answer(f"{title} ({total}):\n" + "\n".join(lines))
-
-
-@dp.callback_query(F.data.regexp(r"^my_c_\d+$"))
-async def my_toggle(callback: types.CallbackQuery):
-    await callback.answer()
-    gid = int(callback.data.rsplit("_", 1)[1])
-    g = await get_owned(callback, gid)
-    if not g or g["kind"] != "normal" or g["status"] not in ("active", "closed"):
-        return
-    new = "closed" if g["status"] == "active" else "active"
-    async with dp["pool"].acquire() as conn:
-        await conn.execute("UPDATE giveaways SET status=$2 WHERE id=$1", gid, new)
-    await callback.message.answer("🔒 Приём закрыт: новые участники не смогут присоединиться."
-                                  if new == "closed" else "🔓 Приём снова открыт.")
-    await show_my_details(callback.message, gid)
-
-
-@dp.callback_query(F.data.regexp(r"^my_f_\d+$"))
-async def my_fast_stop(callback: types.CallbackQuery):
-    await callback.answer()
-    gid = int(callback.data.rsplit("_", 1)[1])
-    g = await get_owned(callback, gid)
-    if not g or g["kind"] != "fast":
-        return
-    async with dp["pool"].acquire() as conn:
-        await conn.execute("UPDATE giveaways SET status='finished' WHERE id=$1", gid)
-    await callback.message.answer("⏹ Фаст-клик завершён: больше никто не сможет забрать приз.\n"
-                                  "Теперь можно создать новый конкурс.")
-
-
-@dp.callback_query(F.data.regexp(r"^my_post_\d+$"))
-async def my_repost(callback: types.CallbackQuery):
-    await callback.answer()
-    gid = int(callback.data.rsplit("_", 1)[1])
-    g = await get_owned(callback, gid)
-    if not g:
-        return
-    await callback.message.answer("Перешлите это сообщение в канал 👇")
-    await callback.message.answer(await build_post(g))
-
-
-@dp.callback_query(F.data.regexp(r"^my_d_\d+$"))
-async def my_delete_ask(callback: types.CallbackQuery):
-    await callback.answer()
-    gid = int(callback.data.rsplit("_", 1)[1])
-    if not await get_owned(callback, gid):
-        return
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Да, удалить", callback_data=f"my_dy_{gid}")
-    kb.button(text="❌ Отмена", callback_data="my_dn")
-    kb.adjust(1)
-    await callback.message.answer(f"Удалить конкурс #{gid} вместе со всеми участниками? Это нельзя отменить.",
-                                  reply_markup=kb.as_markup())
-
-
-@dp.callback_query(F.data.regexp(r"^my_dy_\d+$"))
-async def my_delete_do(callback: types.CallbackQuery):
-    await callback.answer()
-    gid = int(callback.data.rsplit("_", 1)[1])
-    if not await get_owned(callback, gid):
-        return
-    async with dp["pool"].acquire() as conn:
-        await conn.execute("DELETE FROM giveaways WHERE id=$1", gid)
-    await callback.message.answer(f"🗑 Конкурс #{gid} удалён.")
-
-
-@dp.callback_query(F.data == "my_dn")
-async def my_delete_cancel(callback: types.CallbackQuery):
-    await callback.answer("Отменено")
+        kind = "⚡️" if r["kind"] == "fast" else "📊"
+        st = "🟢" if r["status"] == "active" else "🔴"
+        extra = f" · {r['cnt']} уч." if r["kind"] == "normal" else ""
+        lines.append(f"{kind}{st} <b>#{r['id']}</b> — {esc(r['prize'])}{extra}")
+    await message.answer("\n".join(lines))
 
 
 # ============================== Создание конкурса ==============================
@@ -1213,18 +1011,6 @@ async def cmd_new_giveaway(message: types.Message, state: FSMContext):
     if not await is_creator(dp["pool"], message.from_user.id):
         await message.answer("❌ У вас нет доступа! Купить доступ или написать админу — /start")
         return
-    if message.from_user.id != ADMIN_ID:
-        async with dp["pool"].acquire() as conn:
-            cur = await conn.fetchval(
-                "SELECT id FROM giveaways WHERE creator_id=$1 AND status IN ('active','closed') "
-                "ORDER BY id DESC LIMIT 1", message.from_user.id)
-        if cur:
-            kb = InlineKeyboardBuilder()
-            kb.button(text=f"📋 Открыть конкурс #{cur}", callback_data=f"my_g_{cur}")
-            await message.answer(f"⚠️ У вас уже есть активный конкурс <b>#{cur}</b>.\n"
-                                 "Завершите его (подведите итоги, остановите или удалите), "
-                                 "и тогда можно будет создать новый.", reply_markup=kb.as_markup())
-            return
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Обычный конкурс", callback_data="mode_normal")
     kb.button(text="⚡️ Фаст-Клик", callback_data="mode_fast")
