@@ -699,24 +699,43 @@ async def process_prize_details(message: types.Message, state: FSMContext):
         await state.clear()
     else:
         await state.update_data(prize=prize)
-        await message.answer("Введите <b>кодовое слово</b>. Спрячьте его в своём канале (пост, закреп, описание) — "
-                             "участники должны его найти и ввести в боте:")
+        kb = InlineKeyboardBuilder()
+        kb.button(text="⏭ Без кодового слова", callback_data="skip_code")
+        await message.answer("Введите <b>кодовое слово</b> (необязательно). Спрячьте его в своём канале — "
+                             "участники должны найти его и ввести в боте.\n"
+                             "Или нажмите кнопку, чтобы участвовать в один клик:",
+                             reply_markup=kb.as_markup())
         await state.set_state(GiveawayForm.code_word)
+
+
+async def ask_conditions(message: types.Message, state: FSMContext, has_code: bool):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏭ Пропустить", callback_data="skip_conditions")
+    if has_code:
+        text = ("Напишите условия: где искать кодовое слово "
+                "(например: «Кодовое слово в закрепе канала @PavelBet») — или нажмите кнопку:")
+    else:
+        text = ("Напишите условия участия "
+                "(например: «Подпишись на @PavelBet и нажми Участвовать») — или нажмите кнопку:")
+    await message.answer(text, reply_markup=kb.as_markup())
+    await state.set_state(GiveawayForm.conditions)
+
+
+@dp.callback_query(GiveawayForm.code_word, F.data == "skip_code")
+async def skip_code_callback(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(code=None)
+    await ask_conditions(callback.message, state, has_code=False)
 
 
 @dp.message(GiveawayForm.code_word)
 async def process_code_word(message: types.Message, state: FSMContext):
     code = " ".join((message.text or "").split())
     if not (2 <= len(code) <= 64):
-        await message.answer("⚠️ Кодовое слово должно быть от 2 до 64 символов:")
+        await message.answer("⚠️ Кодовое слово должно быть от 2 до 64 символов (или нажмите «Без кодового слова»):")
         return
     await state.update_data(code=code)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⏭ Пропустить", callback_data="skip_conditions")
-    await message.answer("Напишите условия: где искать кодовое слово "
-                         "(например: «Кодовое слово в закрепе канала @PavelBet») — или нажмите кнопку:",
-                         reply_markup=kb.as_markup())
-    await state.set_state(GiveawayForm.conditions)
+    await ask_conditions(message, state, has_code=True)
 
 
 @dp.callback_query(GiveawayForm.conditions, F.data == "skip_conditions")
@@ -732,21 +751,27 @@ async def process_conditions(message: types.Message, state: FSMContext):
 
 async def finish_creating_giveaway(message: types.Message, creator_id: int, state: FSMContext, conditions: str):
     data = await state.get_data()
-    conditions = conditions or "найдите кодовое слово и введите его в боте"
+    code = data.get("code")
+    conditions = conditions or ("найдите кодовое слово и введите его в боте" if code
+                                else "нажмите «Участвовать»")
     async with dp["pool"].acquire() as conn:
         gid = await conn.fetchval(
             "INSERT INTO giveaways (creator_id, kind, prize, conditions, code) "
             "VALUES ($1,'normal',$2,$3,$4) RETURNING id",
-            creator_id, data["prize"], conditions, data["code"])
+            creator_id, data["prize"], conditions, code)
     me = await bot.get_me()
     link = f"{LINK_BASE}/{me.username}?start=join_{gid}"
     await message.answer("Готово! Перешлите это сообщение в канал 👇")
     await message.answer(f"🎉 <b>РОЗЫГРЫШ #{gid}</b> 🎉\n\n🎁 Приз: {esc(data['prize'])}\n"
                          f"📌 Условия: {esc(conditions)}\n\n"
                          f'👉 <a href="{esc(link)}">🎉 Участвовать</a>')
-    await message.answer(f"🔑 Кодовое слово: <code>{esc(data['code'])}</code>\n"
-                         f"⚠️ Не публикуйте его в посте с розыгрышем — спрячьте в канале.\n\n"
-                         f"Итоги: <code>/finish {gid}</code>")
+    if code:
+        await message.answer(f"🔑 Кодовое слово: <code>{esc(code)}</code>\n"
+                             f"⚠️ Не публикуйте его в посте с розыгрышем — спрячьте в канале.\n\n"
+                             f"Итоги: кнопка «🏁 Итоги» в меню.")
+    else:
+        await message.answer("ℹ️ Конкурс без кодового слова: участие в один клик.\n"
+                             "Итоги: кнопка «🏁 Итоги» в меню.")
     await state.clear()
 
 
