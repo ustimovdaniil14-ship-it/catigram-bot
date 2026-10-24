@@ -45,6 +45,7 @@ esc = html.escape
 
 class GiveawayForm(StatesGroup):
     mode = State()
+    winners = State()
     prize_type = State()
     prize_details = State()
     code_word = State()
@@ -97,6 +98,7 @@ async def init_db(pool):
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )""")
         await conn.execute("ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS code TEXT")
+        await conn.execute("ALTER TABLE giveaways ADD COLUMN IF NOT EXISTS winners INT NOT NULL DEFAULT 1")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS giveaway_participants (
                 giveaway_id INT NOT NULL REFERENCES giveaways(id) ON DELETE CASCADE,
@@ -107,6 +109,7 @@ async def init_db(pool):
                 PRIMARY KEY (giveaway_id, user_id),
                 UNIQUE (giveaway_id, ticket_number)
             )""")
+        await conn.execute("ALTER TABLE giveaway_participants ADD COLUMN IF NOT EXISTS place INT")
         await conn.execute("CREATE TABLE IF NOT EXISTS sub_ack (user_id BIGINT PRIMARY KEY)")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS payments (
@@ -171,6 +174,7 @@ def norm_code(s: str) -> str:
     return " ".join((s or "").split()).casefold()
 
 
+MEDALS = ["🥇", "🥈", "🥉"]
 REQUIRED_CHANNELS = ["PavelBet", "plushpepeholders"]
 
 BTN_NEW = "➕ Создать конкурс"
@@ -285,33 +289,75 @@ async def sub_ok(callback: types.CallbackQuery, state: FSMContext):
     await process_start(callback.message, state, callback.from_user, args or None)
 
 
+async def claim_fast(message: types.Message, user: types.User, gid: int):
+    """Фаст-клик: первые N человек получают призы по местам (без гонок)."""
+    pool = dp["pool"]
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            g = await conn.fetchrow(
+                "SELECT creator_id, prize, winners, winner_id FROM giveaways "
+                "WHERE id=$1 AND kind='fast' FOR UPDATE", gid)
+            if not g:
+                res = ("missing",)
+            elif g["creator_id"] == user.id:
+                res = ("creator",)
+            else:
+                n = g["winners"] or 1
+                mine = await conn.fetchval(
+                    "SELECT place FROM giveaway_participants WHERE giveaway_id=$1 AND user_id=$2", gid, user.id)
+                taken = await conn.fetchval("SELECT count(*) FROM giveaway_participants WHERE giveaway_id=$1", gid)
+                if taken == 0 and g["winner_id"] is not None:
+                    taken = 1  # старый фаст-клик (до обновления)
+                if mine:
+                    res = ("mine", mine)
+                elif g["winner_id"] == user.id:
+                    res = ("mine", 1)
+                elif taken >= n:
+                    res = ("full",)
+                else:
+                    place = taken + 1
+                    await conn.execute(
+                        "INSERT INTO giveaway_participants (giveaway_id, user_id, username, ticket_number, won, place) "
+                        "VALUES ($1,$2,$3,$4,TRUE,$4)", gid, user.id, user.username, place)
+                    if place == 1:
+                        await conn.execute("UPDATE giveaways SET winner_id=$2, winner_username=$3 WHERE id=$1",
+                                           gid, user.id, user.username)
+                    if place >= n:
+                        await conn.execute("UPDATE giveaways SET status='finished' WHERE id=$1", gid)
+                    res = ("win", place, g["prize"], n, g["creator_id"])
+
+    kind = res[0]
+    if kind == "missing":
+        await message.answer("⚠️ Розыгрыш не найден.")
+    elif kind == "creator":
+        await message.answer("🙅 Создатель не может участвовать в своём фаст-клике.")
+    elif kind == "mine":
+        await message.answer(f"ℹ️ Вы уже забрали приз в этом розыгрыше ({res[1]} место).")
+    elif kind == "full":
+        await message.answer("❌ К сожалению, все призы уже забрали!")
+    else:
+        _, place, prize, n, creator_id = res
+        prizes = prize.split(" | ") if n > 1 else [prize]
+        mine_prize = prizes[min(place, len(prizes)) - 1]
+        if n > 1:
+            head = f"⚡️ <b>ПОЗДРАВЛЯЕМ! ТЫ ЗАНЯЛ {MEDALS[place - 1]} {place} МЕСТО!</b>"
+            note = f"⚡️ Фаст-клик #{gid}: {place} место — {mention(user.id, user.username)} (<code>{user.id}</code>)"
+        else:
+            head = "⚡️ <b>ПОЗДРАВЛЯЕМ! ТЫ БЫЛ ПЕРВЫМ!</b>"
+            note = f"⚡️ Фаст-клик #{gid} выиграл {mention(user.id, user.username)} (<code>{user.id}</code>)"
+        await message.answer(f"{head}\n\nПриз: <b>{esc(mine_prize)}</b>")
+        try:
+            await bot.send_message(creator_id, note)
+        except TelegramAPIError:
+            pass
+
+
 async def process_start(message: types.Message, state: FSMContext, user: types.User, args):
     pool = dp["pool"]
 
     gid = parse_arg(args, "fast")
     if gid is not None:
-        async with pool.acquire() as conn:
-            g = await conn.fetchrow("SELECT creator_id FROM giveaways WHERE id=$1 AND kind='fast'", gid)
-            if not g:
-                await message.answer("⚠️ Розыгрыш не найден.")
-                return
-            if g["creator_id"] == user.id:
-                await message.answer("🙅 Создатель не может участвовать в своём фаст-клике.")
-                return
-            won = await conn.fetchrow(
-                "UPDATE giveaways SET winner_id=$2, winner_username=$3, status='finished' "
-                "WHERE id=$1 AND winner_id IS NULL RETURNING prize, creator_id",
-                gid, user.id, user.username)
-        if won:
-            await message.answer(f"⚡️ <b>ПОЗДРАВЛЯЕМ! ТЫ БЫЛ ПЕРВЫМ!</b>\n\nПриз: <b>{esc(won['prize'])}</b>")
-            try:
-                await bot.send_message(
-                    won["creator_id"],
-                    f"⚡️ Фаст-клик #{gid} выиграл {mention(user.id, user.username)} (<code>{user.id}</code>)")
-            except TelegramAPIError:
-                pass
-        else:
-            await message.answer("❌ К сожалению, этот приз уже забрали!")
+        await claim_fast(message, user, gid)
         return
 
     gid = parse_arg(args, "join")
@@ -562,7 +608,14 @@ async def adm_game_details(callback: types.CallbackQuery):
         lines.append(f"📌 Условия: {esc(g['conditions'] or '—')}")
         lines.append(f"🔑 Кодовое слово: {('<code>' + esc(g['code']) + '</code>') if g['code'] else '—'}")
         lines.append(f"🎟 Участников: <b>{cnt}</b>")
-    if g["winner_id"]:
+    async with dp["pool"].acquire() as conn:
+        wrows = await conn.fetch("SELECT user_id, username, place FROM giveaway_participants "
+                                 "WHERE giveaway_id=$1 AND place IS NOT NULL ORDER BY place", gid)
+    if wrows:
+        lines.append("🏆 Победители:")
+        lines += [f"{MEDALS[min(r['place'], 3) - 1]} {r['place']} — {mention(r['user_id'], r['username'])} "
+                  f"(<code>{r['user_id']}</code>)" for r in wrows]
+    elif g["winner_id"]:
         lines.append(f"🏆 Победитель: {mention(g['winner_id'], g['winner_username'])} (<code>{g['winner_id']}</code>)")
     kb = InlineKeyboardBuilder()
     if not fast:
@@ -817,7 +870,12 @@ async def cmd_creators(message: types.Message):
 
 
 # ============================== Итоги / реролл ==============================
-async def run_draw(message: types.Message, user_id: int, gid: int, reroll: bool):
+def winner_line(r, place: int, prize: str, many: bool) -> str:
+    head = f"{MEDALS[place - 1]} {place} место — " if many else "🏆 "
+    return f"{head}{mention(r['user_id'], r['username'])} (Билет #{r['ticket_number']})\n🎁 {esc(prize)}"
+
+
+async def run_draw(message: types.Message, user_id: int, gid: int, reroll: bool, place: int = None):
     pool = dp["pool"]
     g = await get_giveaway(pool, gid)
     if not g or g["kind"] != "normal":
@@ -826,37 +884,83 @@ async def run_draw(message: types.Message, user_id: int, gid: int, reroll: bool)
     if g["creator_id"] != user_id and user_id != ADMIN_ID:
         await message.answer("❌ Это не ваш конкурс.")
         return
+    n = g["winners"] or 1
+    many = n > 1
+    prizes = g["prize"].split(" | ") if many else [g["prize"]]
+    prizes += [prizes[-1]] * (n - len(prizes))  # на случай старых данных
+
     if not reroll and g["status"] == "finished":
-        w = mention(g["winner_id"], g["winner_username"]) if g["winner_id"] else "—"
-        await message.answer(f"ℹ️ Конкурс #{gid} уже завершён. Победитель: 🏆 {w}\n"
-                             f"Для нового победителя: <code>/reroll {gid}</code>")
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT user_id, username, ticket_number, place FROM giveaway_participants "
+                "WHERE giveaway_id=$1 AND place IS NOT NULL ORDER BY place", gid)
+        if rows:
+            body = "\n".join(winner_line(r, r["place"], prizes[r["place"] - 1], many) for r in rows)
+        else:
+            body = "🏆 " + (mention(g["winner_id"], g["winner_username"]) if g["winner_id"] else "—")
+        await message.answer(f"ℹ️ Конкурс #{gid} уже завершён.\n{body}\n\nЗамена победителя: кнопка «🔄 Переролл».")
         return
     if reroll and g["status"] != "finished":
-        await message.answer(f"ℹ️ Сначала завершите конкурс: <code>/finish {gid}</code>")
+        await message.answer(f"ℹ️ Сначала завершите конкурс: кнопка «🏁 Итоги».")
+        return
+    if reroll and many and place is None:
+        kb = InlineKeyboardBuilder()
+        for i in range(1, n + 1):
+            kb.button(text=f"{MEDALS[i - 1]} Заменить {i} место", callback_data=f"rrp_{gid}_{i}")
+        kb.adjust(1)
+        await message.answer("Какое место переротить?", reply_markup=kb.as_markup())
+        return
+    if reroll and not many:
+        place = 1
+    if reroll and not (1 <= (place or 0) <= n):
         return
 
     async with pool.acquire() as conn:
         async with conn.transaction():
-            winner = await conn.fetchrow(
+            picked = await conn.fetch(
                 "SELECT user_id, username, ticket_number FROM giveaway_participants "
-                "WHERE giveaway_id=$1 AND NOT won ORDER BY random() LIMIT 1", gid)
-            if winner:
-                await conn.execute("UPDATE giveaway_participants SET won=TRUE WHERE giveaway_id=$1 AND user_id=$2",
-                                   gid, winner["user_id"])
-                await conn.execute("UPDATE giveaways SET status='finished', winner_id=$2, winner_username=$3 "
-                                   "WHERE id=$1", gid, winner["user_id"], winner["username"])
-    if not winner:
+                "WHERE giveaway_id=$1 AND NOT won ORDER BY random() LIMIT $2", gid, 1 if reroll else n)
+            places = [place] if reroll else list(range(1, len(picked) + 1))
+            if picked and reroll:
+                await conn.execute("UPDATE giveaway_participants SET place=NULL WHERE giveaway_id=$1 AND place=$2",
+                                   gid, place)
+            for r, pl in zip(picked, places):
+                await conn.execute("UPDATE giveaway_participants SET won=TRUE, place=$3 "
+                                   "WHERE giveaway_id=$1 AND user_id=$2", gid, r["user_id"], pl)
+            if picked:
+                await conn.execute("UPDATE giveaways SET status='finished' WHERE id=$1", gid)
+                for r, pl in zip(picked, places):
+                    if pl == 1:
+                        await conn.execute("UPDATE giveaways SET winner_id=$2, winner_username=$3 WHERE id=$1",
+                                           gid, r["user_id"], r["username"])
+    if not picked:
         await message.answer(f"❌ Нет подходящих участников в конкурсе #{gid}.")
         return
 
-    title = "🔄 Новый победитель" if reroll else "🎉 Победитель розыгрыша"
-    await message.answer(f"{title} #{gid}:\n🏆 {mention(winner['user_id'], winner['username'])} "
-                         f"(Билет #{winner['ticket_number']})\n🎁 Приз: {esc(g['prize'])}")
-    try:
-        await bot.send_message(winner["user_id"], f"🏆 Вы победили в конкурсе #{gid}!\nПриз: {esc(g['prize'])}\n"
+    if reroll:
+        title = f"🔄 Новый победитель{f' ({place} место)' if many else ''}"
+    else:
+        title = "🎉 Победители розыгрыша" if many else "🎉 Победитель розыгрыша"
+    body = "\n".join(winner_line(r, pl, prizes[pl - 1], many) for r, pl in zip(picked, places))
+    extra = ""
+    if not reroll and len(picked) < n:
+        extra = f"\n\n⚠️ Участников меньше, чем призов: выбрано {len(picked)} из {n}."
+    await message.answer(f"{title} #{gid}:\n{body}{extra}")
+    for r, pl in zip(picked, places):
+        try:
+            await bot.send_message(r["user_id"], f"🏆 Вы победили в конкурсе #{gid}!\nПриз: {esc(prizes[pl - 1])}\n"
                                                   f"Свяжитесь с организатором.")
-    except TelegramAPIError:
-        pass
+        except TelegramAPIError:
+            pass
+
+
+@dp.callback_query(F.data.regexp(r"^rrp_\d+_\d+$"))
+async def reroll_place_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    _, gid, place = callback.data.split("_")
+    if not await is_creator(dp["pool"], callback.from_user.id):
+        return
+    await run_draw(callback.message, callback.from_user.id, int(gid), reroll=True, place=int(place))
 
 
 @dp.message(Command("finish"))
@@ -908,30 +1012,54 @@ async def cmd_new_giveaway(message: types.Message, state: FSMContext):
         await message.answer("❌ У вас нет доступа! Купить доступ или написать админу — /start")
         return
     kb = InlineKeyboardBuilder()
-    kb.button(text="📊 Обычный конкурс (кодовое слово)", callback_data="mode_normal")
+    kb.button(text="📊 Обычный конкурс", callback_data="mode_normal")
     kb.button(text="⚡️ Фаст-Клик", callback_data="mode_fast")
     kb.adjust(1)
     await message.answer("Выберите формат:", reply_markup=kb.as_markup())
     await state.set_state(GiveawayForm.mode)
 
 
-@dp.callback_query(GiveawayForm.mode, F.data.in_(["mode_normal", "mode_fast"]))
-async def process_mode(callback: types.CallbackQuery, state: FSMContext):
-    await state.update_data(mode="fast" if callback.data == "mode_fast" else "normal")
+async def ask_prize_type(message: types.Message, state: FSMContext):
     kb = InlineKeyboardBuilder()
     kb.button(text="🖼 NFT", callback_data="type_nft")
     kb.button(text="🎁 Stars", callback_data="type_regular")
     kb.adjust(1)
-    await callback.message.answer("Выберите тип приза:", reply_markup=kb.as_markup())
+    await message.answer("Выберите тип приза:", reply_markup=kb.as_markup())
     await state.set_state(GiveawayForm.prize_type)
+
+
+def prize_prompt(prize_type: str, place: int, total: int) -> str:
+    suffix = f" для {place} места" if total > 1 else ""
+    if prize_type == "NFT":
+        return f"Отправьте ссылку на NFT{suffix}:"
+    return f"Введите количество звёзд цифрами{suffix}:"
+
+
+@dp.callback_query(GiveawayForm.mode, F.data.in_(["mode_normal", "mode_fast"]))
+async def process_mode(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
+    await state.update_data(mode="fast" if callback.data == "mode_fast" else "normal", prizes=[])
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🥇 1 победитель", callback_data="winners_1")
+    kb.button(text="🥇🥈 2 победителя", callback_data="winners_2")
+    kb.adjust(1)
+    await callback.message.answer("Сколько будет победителей?", reply_markup=kb.as_markup())
+    await state.set_state(GiveawayForm.winners)
+
+
+@dp.callback_query(GiveawayForm.winners, F.data.in_(["winners_1", "winners_2"]))
+async def process_winners(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(winners=int(callback.data.split("_")[1]), prizes=[])
+    await ask_prize_type(callback.message, state)
 
 
 @dp.callback_query(GiveawayForm.prize_type, F.data.in_(["type_nft", "type_regular"]))
 async def process_prize_type(callback: types.CallbackQuery, state: FSMContext):
-    is_nft = callback.data == "type_nft"
-    await state.update_data(prize_type="NFT" if is_nft else "Stars")
-    await callback.message.answer("Отправьте ссылку на NFT:" if is_nft else "Введите количество звёзд цифрами:")
+    ptype = "NFT" if callback.data == "type_nft" else "Stars"
+    await state.update_data(prize_type=ptype)
+    data = await state.get_data()
+    await callback.message.answer(prize_prompt(ptype, 1, data.get("winners", 1)))
     await state.set_state(GiveawayForm.prize_details)
     await callback.answer()
 
@@ -953,19 +1081,36 @@ async def process_prize_details(message: types.Message, state: FSMContext):
             return
         prize = f"NFT (https://tg.catup.lol/nft/{m.group(1)})"
 
+    n = data.get("winners", 1)
+    prizes = list(data.get("prizes", []))
+    if data["prize_type"] == "NFT" and prize in prizes:
+        await message.answer("⚠️ Эта ссылка уже указана для другого места. Отправьте другую:")
+        return
+    prizes.append(prize)
+    if len(prizes) < n:
+        await state.update_data(prizes=prizes)
+        await message.answer(prize_prompt(data["prize_type"], len(prizes) + 1, n))
+        return
+    full_prize = " | ".join(prizes)
+
     if data["mode"] == "fast":
         async with dp["pool"].acquire() as conn:
             gid = await conn.fetchval(
-                "INSERT INTO giveaways (creator_id, kind, prize) VALUES ($1,'fast',$2) RETURNING id",
-                message.from_user.id, prize)
+                "INSERT INTO giveaways (creator_id, kind, prize, winners) VALUES ($1,'fast',$2,$3) RETURNING id",
+                message.from_user.id, full_prize, n)
         me = await bot.get_me()
         link = f"{LINK_BASE}/{me.username}?start=fast_{gid}"
+        if n > 1:
+            prize_block = f"🎁 Призы (первые {n} человека):\n" + "\n".join(
+                f"{MEDALS[i]} {i + 1} место: {esc(p)}" for i, p in enumerate(prizes))
+        else:
+            prize_block = f"Приз: {esc(prizes[0])}"
         await message.answer("Готово! Перешлите это сообщение в канал 👇")
-        await message.answer(f"⚡️ <b>Фаст-клик розыгрыш #{gid}!</b>\nПриз: {esc(prize)}\n\n"
+        await message.answer(f"⚡️ <b>Фаст-клик розыгрыш #{gid}!</b>\n{prize_block}\n\n"
                              f'👉 <a href="{esc(link)}">Забрать приз</a>')
         await state.clear()
     else:
-        await state.update_data(prize=prize)
+        await state.update_data(prizes=prizes, prize=full_prize)
         kb = InlineKeyboardBuilder()
         kb.button(text="⏭ Без кодового слова", callback_data="skip_code")
         await message.answer("Введите <b>кодовое слово</b> (необязательно). Спрячьте его в своём канале — "
@@ -1023,13 +1168,18 @@ async def finish_creating_giveaway(message: types.Message, creator_id: int, stat
                                 else "нажмите «Участвовать»")
     async with dp["pool"].acquire() as conn:
         gid = await conn.fetchval(
-            "INSERT INTO giveaways (creator_id, kind, prize, conditions, code) "
-            "VALUES ($1,'normal',$2,$3,$4) RETURNING id",
-            creator_id, data["prize"], conditions, code)
+            "INSERT INTO giveaways (creator_id, kind, prize, conditions, code, winners) "
+            "VALUES ($1,'normal',$2,$3,$4,$5) RETURNING id",
+            creator_id, data["prize"], conditions, code, data.get("winners", 1))
     me = await bot.get_me()
     link = f"{LINK_BASE}/{me.username}?start=join_{gid}"
     await message.answer("Готово! Перешлите это сообщение в канал 👇")
-    await message.answer(f"🎉 <b>РОЗЫГРЫШ #{gid}</b> 🎉\n\n🎁 Приз: {esc(data['prize'])}\n"
+    prizes = data["prize"].split(" | ")
+    if len(prizes) > 1:
+        prize_block = "🎁 Призы:\n" + "\n".join(f"{MEDALS[i]} {i + 1} место: {esc(p)}" for i, p in enumerate(prizes))
+    else:
+        prize_block = f"🎁 Приз: {esc(prizes[0])}"
+    await message.answer(f"🎉 <b>РОЗЫГРЫШ #{gid}</b> 🎉\n\n{prize_block}\n"
                          f"📌 Условия: {esc(conditions)}\n\n"
                          f'👉 <a href="{esc(link)}">🎉 Участвовать</a>')
     if code:
